@@ -70,6 +70,27 @@ int main(void)
     err = ef_sync_ex(db, EF_SYNC_ASYNC);
     expect_err(err, EF_OK, "embedded sync noop");
 
+    {
+        uint64_t blob_id = 0;
+        uint8_t blob[72];
+        uint8_t out[72];
+        size_t out_len = 0;
+        size_t i;
+
+        for (i = 0; i < sizeof(blob); ++i) {
+            blob[i] = (uint8_t)(0xA0U + (i & 0x0FU));
+        }
+
+        err = ef_alloc_slot(db, &blob_id);
+        expect_err(err, EF_OK, "embedded blob alloc");
+        err = ef_write_blob(db, blob_id, blob, sizeof(blob));
+        expect_err(err, EF_OK, "embedded blob write");
+        err = ef_read_blob(db, blob_id, out, sizeof(out), &out_len);
+        expect_err(err, EF_OK, "embedded blob read");
+        expect_true(out_len == sizeof(blob), "embedded blob size");
+        expect_true(memcmp(blob, out, sizeof(blob)) == 0, "embedded blob bytes");
+    }
+
     ef_close(db);
 
     err = ef_open_memory(arena, sizeof(arena), 32, 0, &db);

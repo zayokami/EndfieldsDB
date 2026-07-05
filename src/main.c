@@ -265,6 +265,285 @@ static void test_memory_backend(void)
     }
 }
 
+static int count_used_visit(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot, void *ctx)
+{
+    int *count = (int *)ctx;
+    (void)db;
+    (void)slot_id;
+    (void)slot;
+    ++*count;
+    return 1;
+}
+
+static void test_slot_iterator_memory(void)
+{
+    static uint8_t buf[64 + 32 * 64];
+    struct ef_db *db = NULL;
+    struct ef_slot_iter it;
+    uint64_t id = 0;
+    uint64_t found_id = 0;
+    struct ef_slot *found_slot = NULL;
+    int visit_count = 0;
+    int iter_count = 0;
+    enum ef_err err;
+
+    err = ef_open_memory(buf, sizeof(buf), 32, 1, &db);
+    expect_err(err, EF_OK, "iterator memory open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &id);
+    expect_err(err, EF_OK, "iterator alloc a");
+    err = ef_write_payload(db, id, "A", 1);
+    expect_err(err, EF_OK, "iterator write a");
+
+    err = ef_alloc_slot(db, &id);
+    expect_err(err, EF_OK, "iterator alloc b");
+    err = ef_write_payload(db, id, "B", 1);
+    expect_err(err, EF_OK, "iterator write b");
+
+    err = ef_foreach_used(db, count_used_visit, &visit_count);
+    expect_err(err, EF_OK, "ef_foreach_used");
+    expect_true(visit_count == 2, "foreach sees two used slots");
+
+    ef_slot_iter_init(db, &it);
+    while (ef_slot_iter_next(&it, &found_id, &found_slot) == 1) {
+        ++iter_count;
+        expect_true(found_slot != NULL, "iter slot pointer");
+        expect_true(found_slot->status == EF_STATUS_USED, "iter slot used");
+    }
+    expect_true(iter_count == 2, "slot_iter sees two used slots");
+
+    ef_close(db);
+}
+
+static void test_blob_memory(void)
+{
+    static uint8_t buf[64 + 64 * 64];
+    struct ef_db *db = NULL;
+    uint64_t id = 0;
+    uint8_t blob[120];
+    uint8_t out[120];
+    size_t out_len = 0;
+    int visit_count = 0;
+    size_t i;
+    enum ef_err err;
+
+    for (i = 0; i < sizeof(blob); ++i) {
+        blob[i] = (uint8_t)(i & 0xFFU);
+    }
+
+    err = ef_open_memory(buf, sizeof(buf), 64, 1, &db);
+    expect_err(err, EF_OK, "blob memory open");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(ef_blob_inline_capacity(db) == 40, "blob inline capacity");
+
+    err = ef_alloc_slot(db, &id);
+    expect_err(err, EF_OK, "blob alloc head");
+    expect_true(ef_count_free_slots(db) == 63, "one slot allocated");
+
+    err = ef_write_blob(db, id, blob, sizeof(blob));
+    expect_err(err, EF_OK, "blob write overflow chain");
+    expect_true(ef_blob_size(db, id) == sizeof(blob), "blob stored size");
+
+    memset(out, 0, sizeof(out));
+    err = ef_read_blob(db, id, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "blob read back");
+    expect_true(out_len == sizeof(blob), "blob read length");
+    expect_true(memcmp(blob, out, sizeof(blob)) == 0, "blob payload match");
+
+    visit_count = 0;
+    err = ef_foreach_used(db, count_used_visit, &visit_count);
+    expect_err(err, EF_OK, "blob foreach");
+    expect_true(visit_count == 1, "blob iterator skips overflow slots");
+
+    err = ef_free_slot(db, id);
+    expect_err(err, EF_OK, "blob free releases chain");
+    expect_true(ef_count_free_slots(db) == 64, "blob free restores all slots");
+
+    ef_close(db);
+}
+
+static void test_v1_upgrade_memory(void)
+{
+    static uint8_t buf[64 + 8 * 64];
+    struct ef_superblock *sb;
+    struct ef_slot *slots;
+    struct ef_db *db = NULL;
+    struct ef_slot *slot;
+    uint8_t legacy[EF_PAYLOAD_SIZE_LEGACY];
+    size_t i;
+    enum ef_err err;
+
+    memset(buf, 0, sizeof(buf));
+    sb = (struct ef_superblock *)buf;
+    sb->magic[0] = EF_MAGIC_0;
+    sb->magic[1] = EF_MAGIC_1;
+    sb->magic[2] = EF_MAGIC_2;
+    sb->magic[3] = EF_MAGIC_3;
+    sb->slot_size = EF_SLOT_SIZE;
+    sb->max_slots = 8;
+    sb->free_list_head = (uint64_t)sizeof(struct ef_superblock);
+    sb->schema_version = 1;
+    sb->flags = EF_FLAG_NONE;
+    sb->free_count = 7;
+
+    slots = (struct ef_slot *)(buf + sizeof(struct ef_superblock));
+    for (i = 0; i < sizeof(legacy); ++i) {
+        legacy[i] = (uint8_t)i;
+    }
+    slots[0].status = EF_STATUS_USED;
+    memcpy(&slots[0].header_crc, legacy, sizeof(legacy));
+    for (i = 1; i < 8; ++i) {
+        slots[i].status = EF_STATUS_FREE;
+    }
+
+    err = ef_open_memory(buf, sizeof(buf), 8, 0, &db);
+    expect_err(err, EF_OK, "open legacy v1 image");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(ef_needs_upgrade(db), "legacy needs upgrade");
+    err = ef_upgrade(db);
+    expect_err(err, EF_OK, "ef_upgrade v1 to v2");
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "upgraded schema version");
+    expect_true(ef_needs_upgrade(db) == 0, "no further upgrade needed");
+
+    slot = ef_get_slot(db, 0);
+    expect_true(slot != NULL, "upgraded slot passes crc");
+    for (i = 0; i < EF_PAYLOAD_SIZE; ++i) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "legacy byte %u migrated", (unsigned)i);
+        expect_true(((uint8_t *)ef_slot_payload_ptr(db, slot))[i] == (uint8_t)i, msg);
+    }
+
+    ef_close(db);
+
+    err = ef_open_memory(buf, sizeof(buf), 8, 0, &db);
+    expect_err(err, EF_OK, "reopen upgraded v2 image");
+    if (db != NULL) {
+        expect_true(ef_get_slot(db, 0) != NULL, "v2 reopen validates slot crc");
+        ef_close(db);
+    }
+}
+
+static void test_slot_header_crc_memory(void)
+{
+    static uint8_t buf[64 + 32 * 64];
+    struct ef_db *db = NULL;
+    struct ef_slot *slot;
+    struct ef_slot *ov;
+    uint64_t id_tamper = 0;
+    uint64_t id_zero = 0;
+    uint64_t id_blob = 0;
+    uint64_t ov_id = 0;
+    uint8_t blob[100];
+    uint8_t out[100];
+    size_t out_len = 0;
+    size_t i;
+    enum ef_err err;
+
+    err = ef_open_memory(buf, sizeof(buf), 32, 1, &db);
+    expect_err(err, EF_OK, "slot crc test open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &id_tamper);
+    expect_err(err, EF_OK, "slot crc alloc tamper");
+    err = ef_write_payload(db, id_tamper, "crc-me", 6);
+    expect_err(err, EF_OK, "slot crc write");
+
+    slot = ef_get_slot(db, id_tamper);
+    expect_true(slot != NULL, "slot crc read before tamper");
+    if (slot != NULL) {
+        slot->header_crc ^= 0xA5A5A5A5U;
+        expect_true(ef_get_slot(db, id_tamper) == NULL, "reject tampered header_crc");
+        expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "tampered header_crc error");
+    }
+
+    err = ef_alloc_slot(db, &id_zero);
+    expect_err(err, EF_OK, "slot crc alloc zero");
+    err = ef_write_payload(db, id_zero, "zero", 4);
+    expect_err(err, EF_OK, "slot crc write zero case");
+    slot = ef_get_slot(db, id_zero);
+    expect_true(slot != NULL, "slot crc before zero tamper");
+    if (slot != NULL) {
+        slot->header_crc = 0;
+        expect_true(ef_get_slot(db, id_zero) == NULL, "reject zero header_crc");
+        expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "zero header_crc error");
+    }
+
+    for (i = 0; i < sizeof(blob); ++i) {
+        blob[i] = (uint8_t)(0xC0U + (i & 0x1FU));
+    }
+    err = ef_alloc_slot(db, &id_blob);
+    expect_err(err, EF_OK, "overflow crc alloc head");
+    err = ef_write_blob(db, id_blob, blob, sizeof(blob));
+    expect_err(err, EF_OK, "overflow crc write blob");
+
+    expect_true(db->slots[id_blob].next_offset != 0, "blob has overflow chain");
+    err = ef_offset_to_slot_id(db, db->slots[id_blob].next_offset, &ov_id);
+    expect_err(err, EF_OK, "overflow slot id");
+    ov = db->slots + ov_id;
+    expect_true(ov->status == EF_STATUS_OVERFLOW, "overflow slot status");
+    ov->header_crc ^= 0x0F0F0F0FU;
+    err = ef_read_blob(db, id_blob, out, sizeof(out), &out_len);
+    expect_err(err, EF_ERR_BAD_CHECKSUM, "reject tampered overflow header_crc");
+
+    ef_close(db);
+}
+
+#if EF_HAS_FILE_IO
+static void test_blob_file(void)
+{
+    struct ef_db *db = NULL;
+    uint64_t id = 0;
+    char text[80];
+    char out[80];
+    size_t out_len = 0;
+    size_t i;
+    enum ef_err err;
+
+    remove_test_file("test_blob.endf");
+
+    for (i = 0; i < sizeof(text); ++i) {
+        text[i] = (char)('A' + (i % 26));
+    }
+
+    err = ef_open_ex("test_blob.endf", 16, &db);
+    expect_err(err, EF_OK, "blob file open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &id);
+    expect_err(err, EF_OK, "blob file alloc");
+    err = ef_write_blob(db, id, text, sizeof(text));
+    expect_err(err, EF_OK, "blob file write");
+    ef_close(db);
+
+    err = ef_open_ex("test_blob.endf", 16, &db);
+    expect_err(err, EF_OK, "blob file reopen");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_read_blob(db, id, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "blob file read");
+    expect_true(out_len == sizeof(text), "blob file length");
+    expect_true(memcmp(text, out, sizeof(text)) == 0, "blob file persisted");
+
+    ef_close(db);
+    remove_test_file("test_blob.endf");
+}
+#endif
+
 static void test_reopen_existing(void)
 {
     struct ef_db *db = NULL;
@@ -552,6 +831,88 @@ static void test_superblock_checksum_reject(void)
 
     remove_test_file("test_crc.endf");
 }
+
+static void test_v1_upgrade_file(void)
+{
+    static uint8_t image[64 + 4 * 64];
+    struct ef_superblock *sb;
+    struct ef_slot *slots;
+    struct ef_db *db = NULL;
+    FILE *fp;
+    size_t i;
+    enum ef_err err;
+
+    memset(image, 0, sizeof(image));
+    sb = (struct ef_superblock *)image;
+    sb->magic[0] = EF_MAGIC_0;
+    sb->magic[1] = EF_MAGIC_1;
+    sb->magic[2] = EF_MAGIC_2;
+    sb->magic[3] = EF_MAGIC_3;
+    sb->slot_size = EF_SLOT_SIZE;
+    sb->max_slots = 4;
+    sb->schema_version = 1;
+    sb->flags = EF_FLAG_NONE;
+    sb->free_count = 3;
+
+    slots = (struct ef_slot *)(image + sizeof(struct ef_superblock));
+    slots[0].status = EF_STATUS_USED;
+    memcpy(&slots[0].header_crc, "legacy-v1-payload-data-ok!!", 28);
+    for (i = 1; i < 4; ++i) {
+        slots[i].status = EF_STATUS_FREE;
+    }
+
+    remove_test_file("test_v1.endf");
+    fp = fopen("test_v1.endf", "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "FAIL: cannot create test_v1.endf\n");
+        ++g_failures;
+        return;
+    }
+    fwrite(image, 1, sizeof(image), fp);
+    fclose(fp);
+
+    err = ef_open_ex("test_v1.endf", 4, &db);
+    expect_err(err, EF_OK, "open v1 file");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(ef_needs_upgrade(db), "v1 file needs upgrade");
+    err = ef_upgrade(db);
+    expect_err(err, EF_OK, "upgrade v1 file");
+    expect_true(strncmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, 0)),
+                        "legacy-v1-payload-data-ok!!", 28) == 0,
+                "v1 payload preserved after upgrade");
+    err = ef_sync(db);
+    expect_err(err, EF_OK, "sync upgraded file");
+    ef_close(db);
+
+    err = ef_open_ex("test_v1.endf", 4, &db);
+    expect_err(err, EF_OK, "reopen upgraded v1 file");
+    if (db != NULL) {
+        expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "persisted v2 schema");
+        expect_true(ef_get_slot(db, 0) != NULL, "persisted slot crc");
+        ef_close(db);
+    }
+
+    remove_test_file("test_v1.endf");
+}
+
+static void test_slot_header_crc_file(struct ef_db *db)
+{
+    struct ef_slot *slot;
+    enum ef_err err;
+
+    err = ef_write_payload(db, 20, "slot-crc", 8);
+    expect_err(err, EF_OK, "file slot crc write");
+    slot = ef_get_slot(db, 20);
+    expect_true(slot != NULL, "file slot crc get");
+    if (slot != NULL) {
+        slot->payload[0] = 'X';
+        expect_true(ef_get_slot(db, 20) == NULL, "file payload tamper fails crc");
+        expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "file payload tamper error");
+    }
+}
 #endif
 
 static void test_sync(struct ef_db *db)
@@ -597,6 +958,10 @@ int main(void)
     printf("platform: %s\n", ef_platform_name());
 
     test_memory_backend();
+    test_slot_iterator_memory();
+    test_blob_memory();
+    test_v1_upgrade_memory();
+    test_slot_header_crc_memory();
 
 #if EF_HAS_FILE_IO
     remove_test_file("test.endf");
@@ -614,6 +979,7 @@ int main(void)
     test_chase_loop(db);
     test_chase_n(db);
     test_error_paths(db);
+    test_slot_header_crc_file(db);
     test_sync(db);
     ef_close(db);
 
@@ -623,6 +989,8 @@ int main(void)
     test_grow();
     test_readonly_open();
     test_superblock_checksum_reject();
+    test_v1_upgrade_file();
+    test_blob_file();
 
     if (g_failures == 0) {
         err = ef_open_ex("test.endf", 100, &db);

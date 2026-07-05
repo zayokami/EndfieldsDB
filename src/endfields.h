@@ -12,6 +12,8 @@
 #define EF_MAGIC_3 'F'
 
 #define EF_SLOT_SIZE 64U
+#define EF_SLOT_SHIFT 6U
+#define EF_SLOT_MASK  63U
 #define EF_PAYLOAD_SIZE 48U
 #define EF_PAYLOAD_SIZE_LEGACY 52U
 #define EF_SUPERBLOCK_SIZE 64U
@@ -29,6 +31,11 @@
 
 #define EF_STATUS_FREE 0U
 #define EF_STATUS_USED 1U
+#define EF_STATUS_OVERFLOW 2U
+
+#define EF_BLOB_LEN_SIZE 4U
+#define EF_BLOB_MAGIC 0x424F4C42U /* 'BLOB' little-endian */
+#define EF_BLOB_HDR_SIZE 8U
 
 #define EF_FLAG_NONE      0U
 #define EF_FLAG_SB_CRC    0x01U
@@ -123,6 +130,9 @@ void ef_close(struct ef_db *db);
 int ef_is_readonly(const struct ef_db *db);
 enum ef_err ef_grow(struct ef_db *db, uint64_t new_max_slots);
 
+int ef_needs_upgrade(const struct ef_db *db);
+enum ef_err ef_upgrade(struct ef_db *db);
+
 enum ef_err ef_last_error(const struct ef_db *db);
 const char *ef_strerror(enum ef_err err);
 const char *ef_platform_name(void);
@@ -156,6 +166,24 @@ enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out);
 struct ef_slot *ef_alloc_slot_ptr(struct ef_db *db, uint64_t *slot_id_out);
 enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id);
 uint64_t ef_count_free_slots(const struct ef_db *db);
+
+/* Iterate USED head slots (skips EF_STATUS_OVERFLOW continuation slots). */
+typedef int (*ef_slot_visit_fn)(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot, void *ctx);
+enum ef_err ef_foreach_used(struct ef_db *db, ef_slot_visit_fn fn, void *ctx);
+
+struct ef_slot_iter {
+    struct ef_db *db;
+    uint64_t index;
+};
+
+void ef_slot_iter_init(struct ef_db *db, struct ef_slot_iter *it);
+int ef_slot_iter_next(struct ef_slot_iter *it, uint64_t *slot_id_out, struct ef_slot **slot_out);
+
+/* Blob storage: head payload[0..3] = uint32_t total_len; overflow via next_offset chain. */
+size_t ef_blob_inline_capacity(const struct ef_db *db);
+size_t ef_blob_size(const struct ef_db *db, uint64_t slot_id);
+enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, size_t len);
+enum ef_err ef_read_blob(struct ef_db *db, uint64_t slot_id, void *buf, size_t buf_cap, size_t *out_len);
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux);
 
