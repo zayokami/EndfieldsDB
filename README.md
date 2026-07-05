@@ -10,8 +10,9 @@
 - **指针追逐**：单跳 `ef_chase`、多跳 `ef_chase_n`，带环检测与可选 CPU prefetch
 - **槽位池**：持久化 LIFO 空闲链表（`ef_alloc_slot` / `ef_free_slot`），复用 `next_offset`，无额外元数据开销
 - **尾部自动扩容**（v3）：`ef_alloc` 在空闲链耗尽时 `ef_grow(+1)` 追加槽位
-- **跨进程 FIFO 队列**（v3）：`ef_queue_push` / `ef_queue_pop`，head/tail 存于超级块，原子更新，适合 mmap IPC
+- **跨进程 MPMC 队列**（v3）：`ef_queue_push` / `ef_queue_pop`，dummy 头节点 + 共享自旋锁，多生产者/多消费者安全；空闲链 CAS 弹入/弹出支持并发分配
 - **Robin Hood 哈希索引**（v3）：`ef_index_put` / `ef_index_get`，字符串键直达槽位，装载率可达 90%+
+- **索引生命周期**（v3）：`ef_free_slot` 自动 `ef_index_remove_by_slot`；`ef_index_rehash` 扩容哈希区并搬迁槽区、修正所有物理偏移
 - **紧凑指令集**：`ef_execute` 通过 10 字节 `ef_cmd` 派发读写、追逐、分配等操作
 - **动态扩容**：`ef_grow` 扩展槽位数量（文件 truncate + 重映射，或内存后端）
 - **只读打开**：`ef_open_readonly` 以只读 mmap 打开，写操作返回 `EF_ERR_READONLY`
@@ -77,6 +78,8 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 - `test_grow_memory` — 拒绝非法扩容、4→8→16 扩容、数据保留、重开识别
 - `test_slot_header_crc_*` — 头 CRC / 溢出槽 CRC 篡改、`ef_foreach_used` / `ef_slot_iter` 中止、磁盘篡改后只读打开拒绝
 - `test_v3_alloc_queue_index` — 尾部 grow 分配、FIFO 队列往返、Robin Hood 索引 put/get/remove、队列持久化重开
+- `test_index_lifecycle_and_rehash` — 索引 put → rehash 16→32 → free 后 get 应 NOT_FOUND
+- `test_queue_mpmc` — Windows 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次
 
 ## 快速示例
 
@@ -104,6 +107,10 @@ if (db) {
     char buf[64];
     size_t n;
     ef_queue_pop(db, buf, sizeof(buf), &n);
+
+    /* 哈希表扩容（new_capacity 须为 2 的幂且 > 当前容量） */
+    ef_index_rehash(db, 512);
+    ef_db_refresh_slot_crcs(db);   /* rehash 后如启用槽 CRC 可统一刷新 */
 
     ef_sync(db);
     ef_close(db);
@@ -150,18 +157,24 @@ status (4) | header_crc (4) | payload[48] | next_offset (8)  →  64 字节
 | `EF_STATUS_FREE` | 0 | 空闲链节点 |
 | `EF_STATUS_USED` | 1 | 普通头槽或 blob 头槽 |
 | `EF_STATUS_OVERFLOW` | 2 | blob 溢出续链槽（全 48 字节承载数据） |
-| `EF_STATUS_QUEUED` | 3 | FIFO 队列节点（v3） |
+| `EF_STATUS_QUEUED` | 3 | FIFO 队列数据节点 |
+| `EF_STATUS_QUEUE_DUMMY` | 4 | 队列哨兵头（惰性分配，常驻） |
+| `EF_STATUS_QUEUE_LINK` | 5 | 入队链接中（内部） |
+| `EF_STATUS_QUEUE_DEQ` | 6 | 出队摘链中（内部） |
 
 Blob 头槽 `payload[0..3]` 为 magic `BLOB`，`payload[4..7]` 为 `uint32_t` 总长度，内联数据从第 8 字节起（最多 40 字节）；超出部分经 `next_offset` 串联 `OVERFLOW` 槽。`ef_write_payload` 与 blob 格式互不干扰。
 
-### 超级块 `reserved[24]`（v3）
+### 超级块 `reserved[28]`（v3）
 
 | 偏移 | 字段 | 说明 |
 |------|------|------|
 | `[0..3]` | CRC32 | 超级块校验和（`EF_FLAG_SB_CRC`） |
-| `[4..11]` | `queue_head_offset` | FIFO 队列头（物理偏移） |
-| `[12..19]` | `queue_tail_offset` | FIFO 队列尾（物理偏移） |
+| `[4..11]` | `queue_head_offset` | 指向 dummy 哨兵槽（物理偏移） |
+| `[12..19]` | `queue_tail_offset` | 队列尾（物理偏移） |
 | `[20..23]` | `hash_capacity` | Robin Hood 表容量（2 的幂，0 表示无索引区） |
+| `[24..27]` | `queue_lock` | 跨进程自旋锁（`uint32_t`，0=空闲） |
+
+`free_count` 为 `uint32_t`（与 `reserved` 扩展共同保持超级块 64 字节）。
 
 ### 哈希索引项（16 字节）
 
@@ -176,15 +189,26 @@ key_hash (8) | slot_offset (8)
 
 队列槽 `payload` 布局：`[1 字节长度][数据…]`，最大数据 **47 字节**（`len` 参数为数据长度，不含长度前缀）。
 
+首次 `ef_queue_push` 惰性分配 dummy 哨兵槽；逻辑空队列为 `dummy.next_offset == 0`（`ef_queue_empty`）。
+
+并发语义：
+
+- 入队/出队临界区由超级块 `queue_lock` 自旋锁保护（GCC/Clang `__atomic` CAS）
+- 空闲链在支持原子操作的平台使用 CAS 栈式弹入/弹出，与队列并发安全
+- 高争用返回 `EF_ERR_QUEUE_BUSY`，调用方应重试
+
 ## 空闲链表与分配
 
-删除槽位时：`status → FREE`，`next_offset ← free_list_head`，`free_list_head ← 本槽物理偏移`（LIFO，O(1)）。
+删除槽位时：`status → FREE`，`next_offset ← free_list_head`，`free_list_head ← 本槽物理偏移`（LIFO，O(1)）。若槽曾被索引，先 `ef_index_remove_by_slot`。
 
 | API | 行为 |
 |-----|------|
 | `ef_alloc_slot` | 从空闲链弹出；池空返回 `EF_ERR_SLOT_FULL` |
 | `ef_alloc` | 同上；池空时 `ef_grow(max_slots + 1)` 后重试 |
-| `ef_free_slot` | 归还空闲链（队列槽须先 `ef_queue_pop`） |
+| `ef_free_slot` | 归还空闲链并清除索引项（队列槽须先 `ef_queue_pop`） |
+| `ef_index_rehash` | 扩容哈希区、搬迁槽区、修正 free_list / queue / next_offset 后重插 |
+| `ef_index_remove_by_slot` | 按槽位物理偏移扫描并删除索引项 |
+| `ef_db_refresh_slot_crcs` | 刷新所有需 CRC 的槽头（rehash 后可选） |
 
 ## 许可证
 

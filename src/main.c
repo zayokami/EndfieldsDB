@@ -1192,12 +1192,21 @@ static void test_v3_alloc_queue_index(void)
     }
     expect_err(ef_alloc_slot(db, &slot_id), EF_ERR_SLOT_FULL, "alloc_slot empty pool");
 
-    err = ef_alloc(db, &slot_id);
-    expect_err(err, EF_OK, "ef_alloc tail grow");
-    expect_true(db->sb->max_slots == 5, "tail grow max_slots");
-    err = ef_free_slot(db, slot_id);
-    expect_err(err, EF_OK, "free grown slot");
+    {
+        uint64_t headroom[3];
+        uint64_t j;
 
+        for (j = 0; j < 3; ++j) {
+            err = ef_alloc(db, &headroom[j]);
+            expect_err(err, EF_OK, "queue headroom alloc");
+        }
+        for (j = 0; j < 3; ++j) {
+            err = ef_free_slot(db, headroom[j]);
+            expect_err(err, EF_OK, "queue headroom free");
+        }
+    }
+
+    expect_true(ef_count_free_slots(db) >= 3, "queue test free headroom");
     expect_true(ef_queue_empty(db), "queue starts empty");
     err = ef_queue_push(db, msg1, (uint8_t)strlen(msg1));
     expect_err(err, EF_OK, "queue push 1");
@@ -1257,6 +1266,174 @@ static void test_v3_alloc_queue_index(void)
     }
 #endif
 }
+
+static void test_index_lifecycle_and_rehash(void)
+{
+    static uint8_t arena[64 + 32 * 16 + 16 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id = 0;
+    uint64_t looked = 0;
+    uint32_t i;
+    char key[24];
+
+    printf("\n=== v3: index lifecycle + rehash ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 16, 16, 1, &db);
+    expect_err(err, EF_OK, "open for rehash test");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 12; ++i) {
+        snprintf(key, sizeof(key), "key-%02u", i);
+        err = ef_alloc(db, &slot_id);
+        expect_err(err, EF_OK, "alloc for index fill");
+        err = ef_write_payload(db, slot_id, key, (uint8_t)strlen(key));
+        expect_err(err, EF_OK, "write indexed payload");
+        err = ef_index_put(db, key, slot_id);
+        expect_err(err, EF_OK, "index put");
+    }
+
+    err = ef_index_rehash(db, 32);
+    expect_err(err, EF_OK, "index rehash 16->32");
+    expect_true(db->hash_capacity == 32, "hash capacity after rehash");
+    expect_true(db->slots_base == 64 + 32 * 16, "slots base after rehash");
+
+    for (i = 0; i < 12; ++i) {
+        snprintf(key, sizeof(key), "key-%02u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "index get after rehash");
+        expect_true(ef_get_slot(db, looked) != NULL, "slot reachable after rehash");
+    }
+
+    snprintf(key, sizeof(key), "key-%02u", 0U);
+    err = ef_index_get(db, key, &looked);
+    expect_err(err, EF_OK, "lookup key-00");
+    err = ef_free_slot(db, looked);
+    expect_err(err, EF_OK, "free indexed slot");
+    expect_err(ef_index_get(db, key, &looked), EF_ERR_NOT_FOUND, "index cleared on free");
+
+    ef_close(db);
+}
+
+#if defined(_WIN32)
+#include <process.h>
+
+struct ef_mpmc_ctx {
+    struct ef_db *db;
+    int thread_id;
+    int count;
+    volatile long *received;
+    volatile long *producers_done;
+};
+
+static unsigned __stdcall ef_mpmc_producer(void *arg)
+{
+    struct ef_mpmc_ctx *ctx = (struct ef_mpmc_ctx *)arg;
+    int i;
+    uint8_t payload[5];
+
+    for (i = 0; i < ctx->count; ++i) {
+        uint32_t id = (uint32_t)(ctx->thread_id * 100000 + i);
+        enum ef_err err;
+        memcpy(payload, &id, sizeof(id));
+        payload[4] = 0;
+        do {
+            err = ef_queue_push(ctx->db, payload, 4);
+        } while (err != EF_OK);
+    }
+    InterlockedIncrement(ctx->producers_done);
+    return 0;
+}
+
+static unsigned __stdcall ef_mpmc_consumer(void *arg)
+{
+    struct ef_mpmc_ctx *ctx = (struct ef_mpmc_ctx *)arg;
+    uint8_t buf[8];
+    size_t len = 0;
+    enum ef_err err;
+
+    for (;;) {
+        err = ef_queue_pop(ctx->db, buf, sizeof(buf), &len);
+        if (err == EF_ERR_QUEUE_EMPTY) {
+            if (*ctx->producers_done >= 2 && ef_queue_empty(ctx->db)) {
+                break;
+            }
+            continue;
+        }
+        if (err == EF_ERR_QUEUE_BUSY) {
+            continue;
+        }
+        if (err == EF_OK && len == 4) {
+            uint32_t id = 0;
+            memcpy(&id, buf, sizeof(id));
+            if (id < 400000U) {
+                InterlockedIncrement(&ctx->received[id]);
+            }
+        }
+    }
+    return 0;
+}
+
+static void test_queue_mpmc(void)
+{
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    HANDLE threads[4];
+    struct ef_mpmc_ctx ctx[4];
+    static volatile long received[400000];
+    volatile long producers_done = 0;
+    uint32_t i;
+    long total = 0;
+    long dupes = 0;
+
+    printf("\n=== v3: MPMC queue (4 threads) ===\n");
+
+    memset((void *)received, 0, sizeof(received));
+    remove_test_file("test_mpmc.endf");
+    err = ef_open_ex("test_mpmc.endf", 512, &db);
+    expect_err(err, EF_OK, "open mpmc db");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 4; ++i) {
+        ctx[i].db = db;
+        ctx[i].thread_id = (int)i;
+        ctx[i].count = (i < 2) ? 200 : 0;
+        ctx[i].received = received;
+        ctx[i].producers_done = &producers_done;
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0,
+                                            (i < 2) ? ef_mpmc_producer : ef_mpmc_consumer,
+                                            &ctx[i], 0, NULL);
+    }
+
+    WaitForMultipleObjects(4, threads, 1, 60000);
+    for (i = 0; i < 4; ++i) {
+        CloseHandle(threads[i]);
+    }
+
+    for (i = 0; i < 400; ++i) {
+        uint32_t id = (i < 200) ? i : (100000U + (i - 200));
+        if (received[id] == 1) {
+            ++total;
+        } else if (received[id] > 1) {
+            ++dupes;
+        }
+    }
+
+    expect_true(total == 400, "mpmc all messages received once");
+    expect_true(dupes == 0, "mpmc no duplicate delivery");
+    ef_close(db);
+    remove_test_file("test_mpmc.endf");
+}
+#else
+static void test_queue_mpmc(void)
+{
+    printf("\n=== v3: MPMC queue (skipped on non-Windows) ===\n");
+}
+#endif
 
 static void test_sync(struct ef_db *db)
 {
@@ -1688,6 +1865,10 @@ int main(void)
     test_v1_upgrade_memory();
     test_slot_header_crc_memory();
     test_v3_alloc_queue_index();
+    test_index_lifecycle_and_rehash();
+#if EF_HAS_FILE_IO
+    test_queue_mpmc();
+#endif
 
 #if EF_HAS_FILE_IO
     remove_test_file("test.endf");

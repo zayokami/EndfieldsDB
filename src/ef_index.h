@@ -19,6 +19,8 @@ uint64_t ef_key_hash(const char *key, size_t key_len);
 enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id);
 enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_out);
 enum ef_err ef_index_remove(struct ef_db *db, const char *key);
+enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id);
+enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity);
 enum ef_err ef_index_clear(struct ef_db *db);
 
 #endif

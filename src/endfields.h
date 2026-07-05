@@ -33,6 +33,9 @@
 #define EF_STATUS_USED 1U
 #define EF_STATUS_OVERFLOW 2U
 #define EF_STATUS_QUEUED 3U
+#define EF_STATUS_QUEUE_DUMMY 4U
+#define EF_STATUS_QUEUE_LINK 5U
+#define EF_STATUS_QUEUE_DEQ 6U
 
 #define EF_BLOB_LEN_SIZE 4U
 #define EF_BLOB_MAGIC 0x424F4C42U /* 'BLOB' little-endian */
@@ -58,8 +61,8 @@ struct ef_superblock {
     uint64_t free_list_head;
     uint32_t schema_version;
     uint32_t flags;
-    uint64_t free_count;
-    uint8_t reserved[24];
+    uint32_t free_count;
+    uint8_t reserved[28];
 };
 
 struct ef_cmd {
@@ -98,6 +101,7 @@ enum ef_err {
     EF_ERR_READONLY,
     EF_ERR_GROW,
     EF_ERR_QUEUE_EMPTY,
+    EF_ERR_QUEUE_BUSY,
     EF_ERR_INDEX_FULL
 };
 
@@ -199,10 +203,12 @@ enum ef_err ef_read_blob(struct ef_db *db, uint64_t slot_id, void *buf, size_t b
 /* Persistent LIFO free-list allocator with tail grow (ef_alloc_slot / ef_free_slot). */
 enum ef_err ef_alloc(struct ef_db *db, uint64_t *slot_id_out);
 
-/* Cross-process FIFO queue (head/tail in superblock reserved, lock-free CAS). */
+/* Cross-process FIFO queue (dummy-head list, head/tail/lock in superblock reserved). */
 enum ef_err ef_queue_push(struct ef_db *db, const void *data, uint8_t len);
 enum ef_err ef_queue_pop(struct ef_db *db, void *buf, size_t buf_cap, size_t *out_len);
 int ef_queue_empty(const struct ef_db *db);
+
+void ef_db_refresh_slot_crcs(struct ef_db *db);
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux);
 
