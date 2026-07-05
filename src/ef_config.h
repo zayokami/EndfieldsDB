@@ -1,8 +1,12 @@
 #ifndef EF_CONFIG_H
 #define EF_CONFIG_H
 
-/* Schema version 2 adds superblock and slot header CRC. */
-#define EF_SCHEMA_VERSION 2U
+/* Schema v2: superblock + slot header CRC. v3: hash index region + IPC queue metadata. */
+#define EF_SCHEMA_VERSION 3U
+#define EF_SCHEMA_VERSION_V2 2U
+
+/* Default Robin Hood table size for new databases (power-of-two friendly). */
+#define EF_DEFAULT_HASH_MIN 16U
 
 /* Default maximum pointer-chase depth (cycle guard). */
 #define EF_CHASE_MAX_DEPTH 1024U

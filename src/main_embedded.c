@@ -92,6 +92,38 @@ int main(void)
     }
 
     ef_close(db);
+    db = NULL;
+
+    {
+        static uint8_t grow_arena[64 + 16 * 64];
+        uint64_t seed_id = 0;
+        uint64_t grown_id = 0;
+
+        err = ef_open_memory(grow_arena, sizeof(grow_arena), 4, 1, &db);
+        expect_err(err, EF_OK, "embedded grow open");
+        if (db != NULL) {
+            err = ef_alloc_slot(db, &seed_id);
+            expect_err(err, EF_OK, "embedded grow alloc");
+            err = ef_write_payload(db, seed_id, "grown", 5);
+            expect_err(err, EF_OK, "embedded grow write");
+            err = ef_grow(db, 12);
+            expect_err(err, EF_OK, "embedded grow expand");
+            expect_true(db->sb->max_slots == 12, "embedded grow max_slots");
+            err = ef_alloc_slot(db, &grown_id);
+            expect_err(err, EF_OK, "embedded grow alloc new");
+            expect_true(grown_id == 11, "embedded grow new slot id");
+            ef_close(db);
+
+            err = ef_open_memory(grow_arena, sizeof(grow_arena), 4, 0, &db);
+            expect_err(err, EF_OK, "embedded grow reopen");
+            if (db != NULL) {
+                expect_true(db->sb->max_slots == 12, "embedded grow persisted");
+                expect_true(strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, seed_id)), "grown") == 0,
+                            "embedded grow persisted seed");
+                ef_close(db);
+            }
+        }
+    }
 
     err = ef_open_memory(arena, sizeof(arena), 32, 0, &db);
     expect_err(err, EF_OK, "ef_open_memory reopen");

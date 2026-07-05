@@ -32,6 +32,7 @@
 #define EF_STATUS_FREE 0U
 #define EF_STATUS_USED 1U
 #define EF_STATUS_OVERFLOW 2U
+#define EF_STATUS_QUEUED 3U
 
 #define EF_BLOB_LEN_SIZE 4U
 #define EF_BLOB_MAGIC 0x424F4C42U /* 'BLOB' little-endian */
@@ -95,7 +96,9 @@ enum ef_err {
     EF_ERR_CHASE_DEPTH,
     EF_ERR_CHASE_CYCLE,
     EF_ERR_READONLY,
-    EF_ERR_GROW
+    EF_ERR_GROW,
+    EF_ERR_QUEUE_EMPTY,
+    EF_ERR_INDEX_FULL
 };
 
 enum ef_backend {
@@ -103,6 +106,8 @@ enum ef_backend {
     EF_BACKEND_FILE = 1,
     EF_BACKEND_MEMORY = 2
 };
+
+struct ef_hash_entry;
 
 struct ef_db {
     int fd;
@@ -114,6 +119,8 @@ struct ef_db {
     enum ef_err last_err;
     enum ef_backend backend;
     uint64_t slots_base;
+    uint32_t hash_capacity;
+    struct ef_hash_entry *hash_index;
     int readonly;
 #ifdef _WIN32
     void *map_handle;
@@ -125,6 +132,10 @@ enum ef_err ef_open_ex(const char *filepath, uint64_t initial_slots, struct ef_d
 struct ef_db *ef_open_readonly(const char *filepath);
 enum ef_err ef_open_readonly_ex(const char *filepath, struct ef_db **db_out);
 enum ef_err ef_open_memory(void *buffer, size_t buffer_size, uint64_t max_slots, int init_new, struct ef_db **db_out);
+enum ef_err ef_open_ex_hash(const char *filepath, uint64_t initial_slots, uint32_t hash_capacity,
+                            struct ef_db **db_out);
+enum ef_err ef_open_memory_hash(void *buffer, size_t buffer_size, uint64_t max_slots,
+                                uint32_t hash_capacity, int init_new, struct ef_db **db_out);
 void ef_close(struct ef_db *db);
 
 int ef_is_readonly(const struct ef_db *db);
@@ -184,6 +195,14 @@ size_t ef_blob_inline_capacity(const struct ef_db *db);
 size_t ef_blob_size(const struct ef_db *db, uint64_t slot_id);
 enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, size_t len);
 enum ef_err ef_read_blob(struct ef_db *db, uint64_t slot_id, void *buf, size_t buf_cap, size_t *out_len);
+
+/* Persistent LIFO free-list allocator with tail grow (ef_alloc_slot / ef_free_slot). */
+enum ef_err ef_alloc(struct ef_db *db, uint64_t *slot_id_out);
+
+/* Cross-process FIFO queue (head/tail in superblock reserved, lock-free CAS). */
+enum ef_err ef_queue_push(struct ef_db *db, const void *data, uint8_t len);
+enum ef_err ef_queue_pop(struct ef_db *db, void *buf, size_t buf_cap, size_t *out_len);
+int ef_queue_empty(const struct ef_db *db);
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux);
 

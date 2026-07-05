@@ -26,6 +26,7 @@ set(ENDFIELDS_LIB_SOURCES
     src/endfields.c
     src/ef_port.c
     src/ef_crc.c
+    src/ef_index.c
 )
 
 function(endfields_apply_target_options target_name)
@@ -71,4 +72,4 @@ install(TARGETS endfields endfields_embedded
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
 )
-install(FILES src/endfields.h src/ef_config.h DESTINATION include/endfields)
+install(FILES src/endfields.h src/ef_config.h src/ef_index.h DESTINATION include/endfields)

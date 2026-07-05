@@ -66,6 +66,13 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 | `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O |
 | `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
 
+内存后端 `ef_grow` 在 `map_capacity` 范围内扩展 `file_size`；`ef_open_memory` 重开时会按超级块中的 `max_slots` 自动识别已扩容大小。
+
+## 测试覆盖
+
+- `test_grow_memory` — 拒绝非法扩容、4→8→16 扩容、数据保留、重开识别
+- `test_slot_header_crc_*` — 头 CRC / 溢出槽 CRC 篡改、`ef_foreach_used` / `ef_slot_iter` 中止、磁盘篡改后只读打开拒绝
+
 ## 快速示例
 
 ```c

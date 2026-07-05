@@ -4,6 +4,7 @@
 
 #include "endfields.h"
 #include "ef_config.h"
+#include "ef_index.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -432,6 +433,85 @@ static void test_v1_upgrade_memory(void)
     }
 }
 
+static void test_grow_memory(void)
+{
+    static uint8_t arena[64 + 16 * 64];
+    struct ef_db *db = NULL;
+    uint64_t seed_id = 0;
+    uint64_t grown_id = 0;
+    uint64_t i;
+    enum ef_err err;
+
+    err = ef_open_memory(arena, sizeof(arena), 4, 1, &db);
+    expect_err(err, EF_OK, "grow memory open");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(db->backend == EF_BACKEND_MEMORY, "grow memory backend");
+    expect_true(db->sb->max_slots == 4, "grow memory initial max_slots");
+    expect_true(db->file_size == sizeof(struct ef_superblock) + 4 * sizeof(struct ef_slot),
+                "grow memory initial file_size");
+    expect_true(db->map_capacity == sizeof(arena), "grow memory map_capacity");
+
+    err = ef_alloc_slot(db, &seed_id);
+    expect_err(err, EF_OK, "grow memory alloc seed");
+    err = ef_write_payload(db, seed_id, "grow-seed", 9);
+    expect_err(err, EF_OK, "grow memory write seed");
+    expect_true(ef_count_free_slots(db) == 3, "grow memory one slot used");
+
+    err = ef_grow(db, 3);
+    expect_err(err, EF_ERR_GROW, "grow memory reject non-increase");
+    err = ef_grow(db, 64);
+    expect_err(err, EF_ERR_FILE_SIZE, "grow memory reject over map_capacity");
+
+    err = ef_grow(db, 8);
+    expect_err(err, EF_OK, "grow memory 4 to 8");
+    expect_true(db->sb->max_slots == 8, "grow memory max_slots 8");
+    expect_true(db->file_size == sizeof(struct ef_superblock) + 8 * sizeof(struct ef_slot),
+                "grow memory file_size 8");
+    expect_true(ef_count_free_slots(db) == 7, "grow memory free count after grow");
+    expect_true(strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, seed_id)), "grow-seed") == 0,
+                "grow memory seed preserved");
+
+    err = ef_alloc_slot(db, &grown_id);
+    expect_err(err, EF_OK, "grow memory alloc in new region");
+    expect_true(grown_id == 7, "grow memory first new slot id (LIFO free list)");
+    err = ef_write_payload(db, grown_id, "new-slot", 8);
+    expect_err(err, EF_OK, "grow memory write new slot");
+
+    err = ef_grow(db, 16);
+    expect_err(err, EF_OK, "grow memory 8 to 16");
+    expect_true(db->sb->max_slots == 16, "grow memory max_slots 16");
+    expect_true(ef_count_free_slots(db) == 14, "grow memory free count after second grow");
+
+    for (i = 8; i < 16; ++i) {
+        expect_true(db->slots[i].status == EF_STATUS_FREE, "grow memory appended slot free");
+    }
+
+    ef_close(db);
+
+    err = ef_open_memory(arena, sizeof(arena), 4, 0, &db);
+    expect_err(err, EF_OK, "grow memory reopen detects grown size");
+    if (db != NULL) {
+        expect_true(db->sb->max_slots == 16, "grow memory persisted max_slots");
+        expect_true(strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, seed_id)), "grow-seed") == 0,
+                    "grow memory persisted seed");
+        expect_true(strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, grown_id)), "new-slot") == 0,
+                    "grow memory persisted grown slot");
+        ef_close(db);
+    }
+}
+
+static int crc_foreach_fail_on_bad(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot, void *ctx)
+{
+    (void)db;
+    (void)slot_id;
+    (void)slot;
+    *(int *)ctx += 1;
+    return 1;
+}
+
 static void test_slot_header_crc_memory(void)
 {
     static uint8_t buf[64 + 32 * 64];
@@ -495,6 +575,57 @@ static void test_slot_header_crc_memory(void)
     ov->header_crc ^= 0x0F0F0F0FU;
     err = ef_read_blob(db, id_blob, out, sizeof(out), &out_len);
     expect_err(err, EF_ERR_BAD_CHECKSUM, "reject tampered overflow header_crc");
+
+    {
+        uint64_t id_status = 0;
+        uint64_t id_next = 0;
+        uint64_t id_free = 0;
+        struct ef_slot_iter it;
+        int visit_count = 0;
+        int iter_rc;
+
+        err = ef_alloc_slot(db, &id_status);
+        expect_err(err, EF_OK, "slot crc alloc status");
+        err = ef_write_payload(db, id_status, "status", 6);
+        expect_err(err, EF_OK, "slot crc write status");
+        slot = ef_get_slot(db, id_status);
+        if (slot != NULL) {
+            slot->status = EF_STATUS_OVERFLOW;
+            expect_true(ef_get_slot(db, id_status) == NULL, "reject tampered status");
+            expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "tampered status error");
+        }
+
+        err = ef_alloc_slot(db, &id_next);
+        expect_err(err, EF_OK, "slot crc alloc next");
+        err = ef_write_payload(db, id_next, "next", 4);
+        expect_err(err, EF_OK, "slot crc write next");
+        slot = ef_get_slot(db, id_next);
+        if (slot != NULL) {
+            slot->next_offset ^= 0x00FF00FF00FF00FFULL;
+            expect_true(ef_get_slot(db, id_next) == NULL, "reject tampered next_offset");
+            expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "tampered next_offset error");
+        }
+
+        err = ef_alloc_slot(db, &id_free);
+        expect_err(err, EF_OK, "slot crc alloc free probe");
+        err = ef_free_slot(db, id_free);
+        expect_err(err, EF_OK, "slot crc free probe");
+        expect_true(ef_get_slot(db, id_free) != NULL, "free slot skips crc verify");
+        expect_true(db->slots[id_free].status == EF_STATUS_FREE, "free slot status readable");
+
+        db->slots[id_tamper].header_crc ^= 0x11111111U;
+        visit_count = 0;
+        err = ef_foreach_used(db, crc_foreach_fail_on_bad, &visit_count);
+        expect_err(err, EF_ERR_BAD_CHECKSUM, "foreach aborts on bad slot crc");
+
+        db->slots[id_tamper].header_crc ^= 0x11111111U;
+        ef_slot_iter_init(db, &it);
+        iter_rc = 0;
+        while ((iter_rc = ef_slot_iter_next(&it, NULL, NULL)) == 1) {
+        }
+        expect_true(iter_rc == -1, "slot_iter aborts on bad slot crc");
+        expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "slot_iter bad crc error");
+    }
 
     ef_close(db);
 }
@@ -913,7 +1044,219 @@ static void test_slot_header_crc_file(struct ef_db *db)
         expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "file payload tamper error");
     }
 }
+
+static void test_slot_header_crc_persist_file(void)
+{
+    struct ef_db *db = NULL;
+    struct ef_slot *slot;
+    FILE *fp;
+    long pos;
+    uint32_t crc;
+    enum ef_err err;
+
+    remove_test_file("test_slot_crc.endf");
+
+    err = ef_open_ex("test_slot_crc.endf", 8, &db);
+    expect_err(err, EF_OK, "slot crc persist create");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_write_payload(db, 2, "persist-crc", 11);
+    expect_err(err, EF_OK, "slot crc persist write");
+    ef_close(db);
+
+    fp = fopen("test_slot_crc.endf", "r+b");
+    if (fp == NULL) {
+        fprintf(stderr, "FAIL: open test_slot_crc.endf for tamper\n");
+        ++g_failures;
+        return;
+    }
+
+    pos = (long)(sizeof(struct ef_superblock) + 2 * sizeof(struct ef_slot) +
+                 offsetof(struct ef_slot, header_crc));
+    fseek(fp, pos, SEEK_SET);
+    fread(&crc, sizeof(crc), 1, fp);
+    fseek(fp, pos, SEEK_SET);
+    crc ^= 0xDEADBEEFU;
+    fwrite(&crc, sizeof(crc), 1, fp);
+    fclose(fp);
+
+    err = ef_open_readonly_ex("test_slot_crc.endf", &db);
+    expect_err(err, EF_OK, "slot crc persist readonly reopen");
+    if (db != NULL) {
+        slot = ef_get_slot(db, 2);
+        expect_true(slot == NULL, "persisted slot crc tamper rejected");
+        expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "persisted slot crc error");
+        ef_close(db);
+    }
+
+    remove_test_file("test_slot_crc.endf");
+}
+
+static void test_slot_header_crc_overflow_persist_file(void)
+{
+    struct ef_db *db = NULL;
+    uint64_t head_id = 0;
+    uint64_t ov_id = 0;
+    FILE *fp;
+    long pos;
+    uint32_t crc;
+    uint8_t blob[96];
+    uint8_t out[96];
+    size_t out_len = 0;
+    size_t i;
+    enum ef_err err;
+
+    remove_test_file("test_slot_crc_ov.endf");
+
+    for (i = 0; i < sizeof(blob); ++i) {
+        blob[i] = (uint8_t)(0xD0U + (i & 0x0FU));
+    }
+
+    err = ef_open_ex("test_slot_crc_ov.endf", 16, &db);
+    expect_err(err, EF_OK, "overflow crc persist create");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &head_id);
+    expect_err(err, EF_OK, "overflow crc persist alloc");
+    err = ef_write_blob(db, head_id, blob, sizeof(blob));
+    expect_err(err, EF_OK, "overflow crc persist write");
+    expect_true(db->slots[head_id].next_offset != 0, "overflow crc persist chain");
+    err = ef_offset_to_slot_id(db, db->slots[head_id].next_offset, &ov_id);
+    expect_err(err, EF_OK, "overflow crc persist ov id");
+    ef_close(db);
+
+    fp = fopen("test_slot_crc_ov.endf", "r+b");
+    if (fp == NULL) {
+        fprintf(stderr, "FAIL: open test_slot_crc_ov.endf for tamper\n");
+        ++g_failures;
+        return;
+    }
+
+    pos = (long)(sizeof(struct ef_superblock) + ov_id * sizeof(struct ef_slot) +
+                 offsetof(struct ef_slot, header_crc));
+    fseek(fp, pos, SEEK_SET);
+    fread(&crc, sizeof(crc), 1, fp);
+    fseek(fp, pos, SEEK_SET);
+    crc ^= 0xBEEFU;
+    fwrite(&crc, sizeof(crc), 1, fp);
+    fclose(fp);
+
+    err = ef_open_readonly_ex("test_slot_crc_ov.endf", &db);
+    expect_err(err, EF_OK, "overflow crc persist readonly reopen");
+    if (db != NULL) {
+        err = ef_read_blob(db, head_id, out, sizeof(out), &out_len);
+        expect_err(err, EF_ERR_BAD_CHECKSUM, "persisted overflow crc tamper rejected");
+        ef_close(db);
+    }
+
+    remove_test_file("test_slot_crc_ov.endf");
+}
 #endif
+
+static void test_v3_alloc_queue_index(void)
+{
+    static uint8_t arena[64 + 16 * 16 + 8 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id = 0;
+    uint64_t looked = 0;
+    char out[64];
+    size_t out_len = 0;
+    const char *msg1 = "queue-a";
+    const char *msg2 = "queue-b";
+
+    printf("\n=== v3: tail-grow alloc, FIFO queue, Robin Hood index ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 1, &db);
+    expect_err(err, EF_OK, "ef_open_memory_hash");
+    expect_true(db != NULL, "hash db opened");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "v3 schema");
+    expect_true(db->hash_capacity == 16, "hash capacity bound");
+    expect_true(db->slots_base == 64 + 16 * 16, "slots after hash region");
+
+    {
+        uint64_t i;
+
+        for (i = 0; i < db->sb->max_slots; ++i) {
+            err = ef_alloc_slot(db, &slot_id);
+            expect_err(err, EF_OK, "alloc_slot drain pool");
+        }
+    }
+    expect_err(ef_alloc_slot(db, &slot_id), EF_ERR_SLOT_FULL, "alloc_slot empty pool");
+
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "ef_alloc tail grow");
+    expect_true(db->sb->max_slots == 5, "tail grow max_slots");
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free grown slot");
+
+    expect_true(ef_queue_empty(db), "queue starts empty");
+    err = ef_queue_push(db, msg1, (uint8_t)strlen(msg1));
+    expect_err(err, EF_OK, "queue push 1");
+    err = ef_queue_push(db, msg2, (uint8_t)strlen(msg2));
+    expect_err(err, EF_OK, "queue push 2");
+    expect_true(!ef_queue_empty(db), "queue non-empty");
+
+    err = ef_queue_pop(db, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "queue pop 1");
+    expect_true(out_len == strlen(msg1), "pop len msg1");
+    expect_true(memcmp(out, msg1, out_len) == 0, "pop payload msg1");
+
+    err = ef_queue_pop(db, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "queue pop 2");
+    expect_true(out_len == strlen(msg2), "pop len msg2");
+    expect_true(memcmp(out, msg2, out_len) == 0, "pop payload msg2");
+    expect_true(ef_queue_empty(db), "queue drained");
+
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for index");
+    err = ef_write_payload(db, slot_id, "indexed-value", 13);
+    expect_err(err, EF_OK, "write indexed payload");
+    err = ef_index_put(db, "user:42", slot_id);
+    expect_err(err, EF_OK, "index put");
+    err = ef_index_get(db, "user:42", &looked);
+    expect_err(err, EF_OK, "index get");
+    expect_true(looked == slot_id, "index roundtrip slot id");
+    err = ef_index_remove(db, "user:42");
+    expect_err(err, EF_OK, "index remove");
+    expect_err(ef_index_get(db, "user:42", &looked), EF_ERR_NOT_FOUND, "index miss after remove");
+
+    ef_close(db);
+
+#if EF_HAS_FILE_IO
+    {
+        struct ef_db *file_db = NULL;
+
+        remove_test_file("test_v3.endf");
+        err = ef_open_ex_hash("test_v3.endf", 4, 16, &file_db);
+        expect_err(err, EF_OK, "ef_open_ex_hash file");
+        if (file_db != NULL) {
+            err = ef_queue_push(file_db, "persist", 7);
+            expect_err(err, EF_OK, "file queue push");
+            ef_close(file_db);
+
+            err = ef_open_ex_hash("test_v3.endf", 4, 16, &file_db);
+            expect_err(err, EF_OK, "reopen v3 file");
+            if (file_db != NULL) {
+                expect_true(!ef_queue_empty(file_db), "queue persisted");
+                err = ef_queue_pop(file_db, out, sizeof(out), &out_len);
+                expect_err(err, EF_OK, "file queue pop");
+                expect_true(out_len == 7 && memcmp(out, "persist", 7) == 0, "persisted payload");
+                ef_close(file_db);
+            }
+        }
+        remove_test_file("test_v3.endf");
+    }
+#endif
+}
 
 static void test_sync(struct ef_db *db)
 {
@@ -923,31 +1266,367 @@ static void test_sync(struct ef_db *db)
     expect_err(err, EF_OK, "ef_sync");
 }
 
-static void run_benchmark(struct ef_db *db)
+#define BENCH_ROUNDS 5
+
+static void bench_print_stats(const char *label, int iterations, int rounds, const double *ns_per_op)
+{
+    double min_v;
+    double max_v;
+    double sum;
+    int r;
+
+    min_v = max_v = ns_per_op[0];
+    sum = 0.0;
+    for (r = 0; r < rounds; ++r) {
+        if (ns_per_op[r] < min_v) {
+            min_v = ns_per_op[r];
+        }
+        if (ns_per_op[r] > max_v) {
+            max_v = ns_per_op[r];
+        }
+        sum += ns_per_op[r];
+    }
+
+    printf("  %-42s %9d ops  avg %9.1f ns  min %9.1f  max %9.1f\n",
+           label, iterations, sum / (double)rounds, min_v, max_v);
+}
+
+static void bench_touch_cold_cache(void)
+{
+    static volatile uint8_t scratch[256 * 1024];
+    size_t i;
+
+    for (i = 0; i < sizeof(scratch); i += 64) {
+        scratch[i] = (uint8_t)(scratch[i] + 1U);
+    }
+}
+
+static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
+{
+    uint64_t i;
+    char payload[32];
+    enum ef_err err;
+
+    for (i = 0; i < chain_len; ++i) {
+        snprintf(payload, sizeof(payload), "node-%04llu", (unsigned long long)i);
+        err = ef_write_payload(db, i, payload, (uint8_t)strlen(payload));
+        if (err != EF_OK) {
+            fprintf(stderr, "bench chain write failed at %llu\n", (unsigned long long)i);
+            return;
+        }
+        if (i + 1 < chain_len) {
+            err = ef_set_next_offset(db, i, ef_slot_to_offset(db, i + 1));
+            if (err != EF_OK) {
+                fprintf(stderr, "bench chain link failed at %llu\n", (unsigned long long)i);
+                return;
+            }
+        }
+    }
+}
+
+static void run_perf_suite(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
-    double start;
-    double end;
-    double elapsed;
-    double avg_ns;
-    const int iterations = 1000000;
+    volatile uintptr_t sink = 0;
+    double samples[BENCH_ROUNDS];
+    double t0;
+    double t1;
+    int r;
     int i;
+    const int fast_iters = 500000;
+    const int verify_iters = 200000;
+    const int write_iters = 50000;
+    const int sync_iters = 500;
+    const int hop_iters = 100000;
+    uint64_t slot_id = 7;
 
-    chase_cmd.opcode = EF_OP_CHASE;
-    chase_cmd.param = ef_slot_to_offset(db, 0);
-    chase_cmd.field_offset = 0;
+    printf("\n=== Performance suite (%d rounds each, platform=%s) ===\n",
+           BENCH_ROUNDS, ef_platform_name());
 
-    start = now_seconds();
-    for (i = 0; i < iterations; ++i) {
-        (void)ef_execute(db, &chase_cmd, NULL);
+    bench_prepare_chain(db, 32);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        chase_cmd.opcode = EF_OP_CHASE;
+        chase_cmd.param = ef_slot_to_offset(db, 0);
+        chase_cmd.field_offset = 0;
+        t0 = now_seconds();
+        for (i = 0; i < fast_iters; ++i) {
+            sink ^= (uintptr_t)ef_execute(db, &chase_cmd, NULL);
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)fast_iters * 1e9;
     }
-    end = now_seconds();
+    bench_print_stats("fast chase 1-hop (no CRC)", fast_iters, BENCH_ROUNDS, samples);
 
-    elapsed = end - start;
-    avg_ns = (elapsed / (double)iterations) * 1e9;
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < verify_iters; ++i) {
+            sink ^= (uintptr_t)ef_get_slot(db, (uint64_t)(i % 32));
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)verify_iters * 1e9;
+    }
+    bench_print_stats("ef_get_slot + CRC verify", verify_iters, BENCH_ROUNDS, samples);
 
-    printf("Benchmark: %d executions in %.6f seconds\n", iterations, elapsed);
-    printf("Average latency: %.2f ns per ef_execute\n", avg_ns);
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        bench_touch_cold_cache();
+        t0 = now_seconds();
+        for (i = 0; i < verify_iters / 10; ++i) {
+            bench_touch_cold_cache();
+            sink ^= (uintptr_t)ef_get_slot(db, (uint64_t)(i % 32));
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)(verify_iters / 10) * 1e9;
+    }
+    bench_print_stats("ef_get_slot cold-ish (cache flush)", verify_iters / 10, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        uint32_t hops = 0;
+        t0 = now_seconds();
+        for (i = 0; i < hop_iters; ++i) {
+            sink ^= (uintptr_t)ef_chase_n(db, ef_slot_to_offset(db, 0), 16, &hops);
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)hop_iters * 1e9;
+    }
+    bench_print_stats("chase_n 16 hops (no per-hop CRC)", hop_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        char buf[24];
+        t0 = now_seconds();
+        for (i = 0; i < write_iters; ++i) {
+            snprintf(buf, sizeof(buf), "w-%d-%d", r, i);
+            sink ^= (uintptr_t)ef_write_payload(db, slot_id, buf, (uint8_t)strlen(buf));
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)write_iters * 1e9;
+    }
+    bench_print_stats("ef_write_payload (CRC+sb)", write_iters, BENCH_ROUNDS, samples);
+
+#if EF_HAS_FILE_IO
+    if (db->backend == EF_BACKEND_FILE) {
+        for (r = 0; r < BENCH_ROUNDS; ++r) {
+            char buf[24];
+            t0 = now_seconds();
+            for (i = 0; i < sync_iters; ++i) {
+                snprintf(buf, sizeof(buf), "s-%d-%d", r, i);
+                sink ^= (uintptr_t)ef_write_payload(db, slot_id, buf, (uint8_t)strlen(buf));
+                sink ^= (uintptr_t)ef_sync(db);
+            }
+            t1 = now_seconds();
+            samples[r] = (t1 - t0) / (double)sync_iters * 1e9;
+        }
+        bench_print_stats("write_payload + ef_sync (full)", sync_iters, BENCH_ROUNDS, samples);
+    }
+#endif
+
+    (void)sink;
+    printf("  (sink=%llu — anti-optimize guard)\n", (unsigned long long)sink);
+}
+
+#if EF_HAS_FILE_IO
+static void run_engineering_scenarios(void)
+{
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    double t0;
+    double t1;
+    int round;
+    const int rounds = 3;
+    uint64_t i;
+    uint64_t id;
+
+    printf("\n=== Engineering scenarios (%d rounds, file backend) ===\n", rounds);
+
+    for (round = 0; round < rounds; ++round) {
+        uint64_t verified = 0;
+        uint64_t chase_ok = 0;
+        char expect[32];
+        size_t out_len = 0;
+        uint8_t blob[96];
+        uint8_t blob_out[96];
+
+        remove_test_file("test_engineering.endf");
+
+        t0 = now_seconds();
+        err = ef_open_ex("test_engineering.endf", 128, &db);
+        if (err != EF_OK || db == NULL) {
+            fprintf(stderr, "engineering open failed round %d\n", round);
+            continue;
+        }
+
+        for (i = 0; i < 64; ++i) {
+            snprintf(expect, sizeof(expect), "save-%02llu", (unsigned long long)i);
+            if (i == 0) {
+                err = ef_write_payload(db, i, expect, (uint8_t)strlen(expect));
+            } else {
+                err = ef_alloc_slot(db, &id);
+                if (err == EF_OK) {
+                    err = ef_write_payload(db, id, expect, (uint8_t)strlen(expect));
+                }
+            }
+            if (err != EF_OK) {
+                break;
+            }
+        }
+        err = ef_sync(db);
+        ef_close(db);
+        t1 = now_seconds();
+        printf("  Round %d  create+64 writes+sync:     %.3f ms\n", round, (t1 - t0) * 1000.0);
+
+        t0 = now_seconds();
+        err = ef_open_ex("test_engineering.endf", 128, &db);
+        if (err != EF_OK || db == NULL) {
+            continue;
+        }
+        for (i = 0; i < 64; ++i) {
+            struct ef_slot *slot = ef_get_slot(db, i);
+            snprintf(expect, sizeof(expect), "save-%02llu", (unsigned long long)i);
+            if (slot != NULL &&
+                strcmp((char *)ef_slot_payload_ptr(db, slot), expect) == 0) {
+                ++verified;
+            }
+        }
+        t1 = now_seconds();
+        printf("  Round %d  reopen+64 CRC reads:        %.3f ms  (ok %llu/64)\n",
+               round, (t1 - t0) * 1000.0, (unsigned long long)verified);
+
+        for (i = 0; i < 32; ++i) {
+            snprintf(expect, sizeof(expect), "link-%02llu", (unsigned long long)i);
+            err = ef_write_payload(db, i, expect, (uint8_t)strlen(expect));
+            if (err == EF_OK && i + 1 < 32) {
+                err = ef_set_next_offset(db, i, ef_slot_to_offset(db, i + 1));
+            }
+        }
+
+        t0 = now_seconds();
+        for (i = 0; i < 10000; ++i) {
+            struct ef_slot *end;
+            uint32_t hops = 0;
+            end = ef_chase_n(db, ef_slot_to_offset(db, 0), 31, &hops);
+            if (end != NULL) {
+                ++chase_ok;
+            }
+            (void)hops;
+        }
+        t1 = now_seconds();
+        printf("  Round %d  10k x chase_n(31 hops):      %.3f ms  (%.1f us/chase, ok %llu)\n",
+               round, (t1 - t0) * 1000.0, (t1 - t0) / 10000.0 * 1e6,
+               (unsigned long long)chase_ok);
+
+        for (i = 0; i < sizeof(blob); ++i) {
+            blob[i] = (uint8_t)(round + i);
+        }
+        t0 = now_seconds();
+        for (i = 32; i < 48; ++i) {
+            err = ef_write_blob(db, i, blob, sizeof(blob));
+            if (err != EF_OK) {
+                break;
+            }
+        }
+        t1 = now_seconds();
+        printf("  Round %d  16 blob writes (96B):      %.3f ms\n", round, (t1 - t0) * 1000.0);
+
+        t0 = now_seconds();
+        verified = 0;
+        for (i = 32; i < 48; ++i) {
+            err = ef_read_blob(db, i, blob_out, sizeof(blob_out), &out_len);
+            if (err == EF_OK && out_len == sizeof(blob) &&
+                memcmp(blob, blob_out, sizeof(blob)) == 0) {
+                ++verified;
+            }
+        }
+        t1 = now_seconds();
+        printf("  Round %d  16 blob CRC reads:          %.3f ms  (ok %llu/16)\n",
+               round, (t1 - t0) * 1000.0, (unsigned long long)verified);
+
+        t0 = now_seconds();
+        for (i = 0; i < 2000; ++i) {
+            err = ef_alloc_slot(db, &id);
+            if (err == EF_OK) {
+                (void)ef_free_slot(db, id);
+            }
+        }
+        t1 = now_seconds();
+        printf("  Round %d  2000 alloc/free pairs:      %.3f ms  (%.1f us/pair)\n",
+               round, (t1 - t0) * 1000.0, (t1 - t0) / 2000.0 * 1e6);
+
+        err = ef_grow(db, 192);
+        printf("  Round %d  ef_grow 128->192:           %s  (free=%llu)\n",
+               round, err == EF_OK ? "ok" : ef_strerror(err),
+               (unsigned long long)ef_count_free_slots(db));
+
+        err = ef_sync(db);
+        ef_close(db);
+        remove_test_file("test_engineering.endf");
+    }
+}
+#endif
+
+static void run_memory_engineering(void)
+{
+    static uint8_t arena[64 + 256 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    double t0;
+    double t1;
+    int round;
+    uint64_t i;
+    uint64_t id;
+
+    printf("\n=== Engineering scenarios (3 rounds, memory backend) ===\n");
+
+    for (round = 0; round < 3; ++round) {
+        uint64_t ok = 0;
+        char expect[24];
+
+        t0 = now_seconds();
+        err = ef_open_memory(arena, sizeof(arena), 64, 1, &db);
+        if (err != EF_OK || db == NULL) {
+            continue;
+        }
+
+        for (i = 0; i < 48; ++i) {
+            snprintf(expect, sizeof(expect), "ram-%02llu", (unsigned long long)i);
+            if (i == 0) {
+                err = ef_write_payload(db, 0, expect, (uint8_t)strlen(expect));
+            } else {
+                err = ef_alloc_slot(db, &id);
+                if (err == EF_OK) {
+                    err = ef_write_payload(db, id, expect, (uint8_t)strlen(expect));
+                }
+            }
+        }
+
+        for (i = 0; i < 48; ++i) {
+            struct ef_slot *slot = ef_get_slot(db, i);
+            snprintf(expect, sizeof(expect), "ram-%02llu", (unsigned long long)i);
+            if (slot != NULL &&
+                strcmp((char *)ef_slot_payload_ptr(db, slot), expect) == 0) {
+                ++ok;
+            }
+        }
+
+        err = ef_grow(db, 128);
+        t1 = now_seconds();
+        printf("  Round %d  48 rw + grow 64->128:       %.3f ms  (read ok %llu/48, grow %s)\n",
+               round, (t1 - t0) * 1000.0, (unsigned long long)ok,
+               err == EF_OK ? "ok" : ef_strerror(err));
+
+        ef_close(db);
+
+        t0 = now_seconds();
+        err = ef_open_memory(arena, sizeof(arena), 64, 0, &db);
+        if (db != NULL) {
+            snprintf(expect, sizeof(expect), "ram-%02llu", 0ULL);
+            ok = (ef_get_slot(db, 0) != NULL &&
+                  strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, 0)), expect) == 0) ? 1 : 0;
+            ef_close(db);
+        }
+        t1 = now_seconds();
+        printf("  Round %d  reopen grown arena:         %.3f ms  (slot0 ok=%llu)\n",
+               round, (t1 - t0) * 1000.0, (unsigned long long)ok);
+    }
 }
 
 int main(void)
@@ -960,8 +1639,10 @@ int main(void)
     test_memory_backend();
     test_slot_iterator_memory();
     test_blob_memory();
+    test_grow_memory();
     test_v1_upgrade_memory();
     test_slot_header_crc_memory();
+    test_v3_alloc_queue_index();
 
 #if EF_HAS_FILE_IO
     remove_test_file("test.endf");
@@ -990,14 +1671,20 @@ int main(void)
     test_readonly_open();
     test_superblock_checksum_reject();
     test_v1_upgrade_file();
+    test_slot_header_crc_persist_file();
+    test_slot_header_crc_overflow_persist_file();
     test_blob_file();
 
     if (g_failures == 0) {
+        run_memory_engineering();
+#if EF_HAS_FILE_IO
+        run_engineering_scenarios();
         err = ef_open_ex("test.endf", 100, &db);
         if (err == EF_OK && db != NULL) {
-            run_benchmark(db);
+            run_perf_suite(db);
             ef_close(db);
         }
+#endif
     }
 #else
     (void)db;
