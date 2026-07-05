@@ -1443,18 +1443,69 @@ static void test_sync(struct ef_db *db)
     expect_err(err, EF_OK, "ef_sync");
 }
 
-#define BENCH_ROUNDS 5
+#define BENCH_ROUNDS 15
+#define BENCH_MAX_ROUNDS 32
+#define EF_RUN_BENCH_MPMC 0
+
+static void bench_sort_doubles(double *v, int n)
+{
+    int i;
+    int j;
+
+    for (i = 1; i < n; ++i) {
+        double key = v[i];
+        j = i;
+        while (j > 0 && v[j - 1] > key) {
+            v[j] = v[j - 1];
+            --j;
+        }
+        v[j] = key;
+    }
+}
+
+static double bench_pick_percentile(const double *sorted, int n, double pct)
+{
+    int idx;
+
+    if (n <= 0) {
+        return 0.0;
+    }
+    if (n == 1) {
+        return sorted[0];
+    }
+    idx = (int)((double)(n - 1) * pct + 0.5);
+    if (idx < 0) {
+        idx = 0;
+    }
+    if (idx >= n) {
+        idx = n - 1;
+    }
+    return sorted[idx];
+}
 
 static void bench_print_stats(const char *label, int iterations, int rounds, const double *ns_per_op)
 {
+    double sorted[BENCH_MAX_ROUNDS];
     double min_v;
     double max_v;
     double sum;
+    double p50;
+    double p99;
     int r;
+    int use_rounds;
+
+    use_rounds = rounds;
+    if (use_rounds > BENCH_MAX_ROUNDS) {
+        use_rounds = BENCH_MAX_ROUNDS;
+    }
+    if (use_rounds <= 0) {
+        return;
+    }
 
     min_v = max_v = ns_per_op[0];
     sum = 0.0;
-    for (r = 0; r < rounds; ++r) {
+    for (r = 0; r < use_rounds; ++r) {
+        sorted[r] = ns_per_op[r];
         if (ns_per_op[r] < min_v) {
             min_v = ns_per_op[r];
         }
@@ -1463,10 +1514,58 @@ static void bench_print_stats(const char *label, int iterations, int rounds, con
         }
         sum += ns_per_op[r];
     }
+    bench_sort_doubles(sorted, use_rounds);
+    p50 = bench_pick_percentile(sorted, use_rounds, 0.50);
+    p99 = bench_pick_percentile(sorted, use_rounds, 0.99);
 
-    printf("  %-42s %9d ops  avg %9.1f ns  min %9.1f  max %9.1f\n",
-           label, iterations, sum / (double)rounds, min_v, max_v);
+    printf("  %-40s %9d ops  avg %8.1f ns  p50 %8.1f  p99 %8.1f  min %8.1f  max %8.1f\n",
+           label, iterations, sum / (double)use_rounds, p50, p99, min_v, max_v);
 }
+
+#if EF_RUN_BENCH_MPMC
+
+static void bench_print_throughput(const char *label, uint64_t total_ops, int rounds, const double *sec_per_round)
+{
+    double sorted[BENCH_MAX_ROUNDS];
+    double min_ops;
+    double max_ops;
+    double sum_ops;
+    double p50;
+    double p99;
+    int r;
+    int use_rounds;
+
+    use_rounds = rounds;
+    if (use_rounds > BENCH_MAX_ROUNDS) {
+        use_rounds = BENCH_MAX_ROUNDS;
+    }
+    if (use_rounds <= 0 || total_ops == 0) {
+        return;
+    }
+
+    min_ops = max_ops = (double)total_ops / sec_per_round[0];
+    sum_ops = 0.0;
+    for (r = 0; r < use_rounds; ++r) {
+        double ops = (double)total_ops / sec_per_round[r];
+        sorted[r] = ops;
+        if (ops < min_ops) {
+            min_ops = ops;
+        }
+        if (ops > max_ops) {
+            max_ops = ops;
+        }
+        sum_ops += ops;
+    }
+    bench_sort_doubles(sorted, use_rounds);
+    p50 = bench_pick_percentile(sorted, use_rounds, 0.50);
+    p99 = bench_pick_percentile(sorted, use_rounds, 0.99);
+
+    printf("  %-40s %9llu ops  avg %8.0f/s  p50 %8.0f/s  p99 %8.0f/s  min %8.0f/s  max %8.0f/s\n",
+           label, (unsigned long long)total_ops, sum_ops / (double)use_rounds, p50, p99, min_ops,
+           max_ops);
+}
+
+#endif
 
 static void bench_touch_cold_cache(void)
 {
@@ -1501,12 +1600,239 @@ static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
     }
 }
 
+static void run_hash_perf_suite(volatile uintptr_t *sink)
+{
+    static uint8_t hash_arena[64 + 256 * 16 + 128 * 64];
+    struct ef_db *db = NULL;
+    double samples[BENCH_MAX_ROUNDS];
+    double t0;
+    double t1;
+    int r;
+    int i;
+    enum ef_err err;
+    const int put_iters = 50000;
+    const int get_iters = 200000;
+    const int remove_iters = 20000;
+    char key[32];
+    uint64_t slot_id;
+    uint64_t looked;
+
+    printf("\n=== Hash index bench (%d rounds, cap=256, slots=128) ===\n", BENCH_ROUNDS);
+
+    err = ef_open_memory_hash(hash_arena, sizeof(hash_arena), 128, 256, 1, &db);
+    if (err != EF_OK || db == NULL) {
+        fprintf(stderr, "hash bench: open failed: %s\n", ef_strerror(err));
+        return;
+    }
+
+    for (i = 0; i < 96; ++i) {
+        snprintf(key, sizeof(key), "pre-%03d", i);
+        err = ef_alloc(db, &slot_id);
+        if (err != EF_OK) {
+            fprintf(stderr, "hash bench: preload alloc failed\n");
+            ef_close(db);
+            return;
+        }
+        err = ef_index_put(db, key, slot_id);
+        if (err != EF_OK) {
+            fprintf(stderr, "hash bench: preload put failed\n");
+            ef_close(db);
+            return;
+        }
+    }
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < put_iters; ++i) {
+            snprintf(key, sizeof(key), "put-%d-%d", r, i);
+            err = ef_alloc(db, &slot_id);
+            if (err == EF_OK) {
+                *sink ^= (uintptr_t)ef_index_put(db, key, slot_id);
+            }
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)put_iters * 1e9;
+    }
+    bench_print_stats("ef_index_put + alloc", put_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < get_iters; ++i) {
+            snprintf(key, sizeof(key), "pre-%03d", i % 96);
+            err = ef_index_get(db, key, &looked);
+            *sink ^= (uintptr_t)err ^ (uintptr_t)looked;
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)get_iters * 1e9;
+    }
+    bench_print_stats("ef_index_get (96 keys, ~38% load)", get_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < remove_iters; ++i) {
+            snprintf(key, sizeof(key), "put-%d-%d", r, i);
+            err = ef_index_get(db, key, &looked);
+            if (err == EF_OK) {
+                (void)ef_index_remove(db, key);
+                *sink ^= (uintptr_t)ef_free_slot(db, looked);
+            }
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)remove_iters * 1e9;
+    }
+    bench_print_stats("index remove + free (put keys)", remove_iters, BENCH_ROUNDS, samples);
+
+    ef_close(db);
+    db = NULL;
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        int j;
+
+        err = ef_open_memory_hash(hash_arena, sizeof(hash_arena), 128, 256, 1, &db);
+        if (err != EF_OK || db == NULL) {
+            break;
+        }
+        for (j = 0; j < 96; ++j) {
+            snprintf(key, sizeof(key), "rh-%03d", j);
+            err = ef_alloc(db, &slot_id);
+            if (err != EF_OK) {
+                break;
+            }
+            err = ef_index_put(db, key, slot_id);
+            if (err != EF_OK) {
+                break;
+            }
+        }
+        t0 = now_seconds();
+        err = ef_index_rehash(db, 512);
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) * 1e9;
+        *sink ^= (uintptr_t)err;
+        ef_close(db);
+        db = NULL;
+    }
+    bench_print_stats("ef_index_rehash 256->512 (fresh db)", 1, BENCH_ROUNDS, samples);
+}
+
+#if EF_RUN_BENCH_MPMC && defined(_WIN32) && EF_HAS_FILE_IO
+
+struct bench_mpmc_ctx {
+    struct ef_db *db;
+    int tid;
+    int count;
+    volatile long *received;
+    volatile long *done;
+};
+
+static unsigned __stdcall bench_mpmc_producer(void *arg)
+{
+    struct bench_mpmc_ctx *ctx = (struct bench_mpmc_ctx *)arg;
+    uint8_t payload[5];
+    int i;
+
+    for (i = 0; i < ctx->count; ++i) {
+        uint32_t id = (uint32_t)(ctx->tid * 100000 + (uint32_t)i);
+        enum ef_err err;
+        memcpy(payload, &id, sizeof(id));
+        do {
+            err = ef_queue_push(ctx->db, payload, 4);
+        } while (err != EF_OK);
+    }
+    InterlockedIncrement(ctx->done);
+    return 0;
+}
+
+static unsigned __stdcall bench_mpmc_consumer(void *arg)
+{
+    struct bench_mpmc_ctx *ctx = (struct bench_mpmc_ctx *)arg;
+    uint8_t buf[8];
+    size_t len;
+
+    for (;;) {
+        enum ef_err err = ef_queue_pop(ctx->db, buf, sizeof(buf), &len);
+        if (err == EF_ERR_QUEUE_EMPTY) {
+            if (*ctx->done >= 2 && ef_queue_empty(ctx->db)) {
+                break;
+            }
+            continue;
+        }
+        if (err == EF_ERR_QUEUE_BUSY) {
+            continue;
+        }
+        (void)len;
+    }
+    return 0;
+}
+
+static void bench_mpmc_throughput(volatile uintptr_t *sink)
+{
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    double sec[BENCH_MAX_ROUNDS];
+    HANDLE threads[4];
+    struct bench_mpmc_ctx ctx[4];
+    static volatile long producers_done;
+    const int per_producer = 2000;
+    const int mpmc_rounds = 5;
+    const uint64_t total_ops = (uint64_t)(per_producer * 2);
+    int r;
+    uint32_t i;
+
+    printf("\n=== MPMC throughput bench (%d rounds, 4 threads, %llu msgs) ===\n",
+           mpmc_rounds, (unsigned long long)total_ops);
+
+    for (r = 0; r < mpmc_rounds; ++r) {
+        double t0;
+        double t1;
+
+        remove_test_file("bench_mpmc.endf");
+        err = ef_open_ex("bench_mpmc.endf", 512, &db);
+        if (err != EF_OK || db == NULL) {
+            fprintf(stderr, "mpmc bench: open failed\n");
+            return;
+        }
+
+        producers_done = 0;
+        t0 = now_seconds();
+        for (i = 0; i < 4; ++i) {
+            ctx[i].db = db;
+            ctx[i].tid = (int)i;
+            ctx[i].count = (i < 2) ? per_producer : 0;
+            ctx[i].received = NULL;
+            ctx[i].done = &producers_done;
+            threads[i] = (HANDLE)_beginthreadex(NULL, 0,
+                                                (i < 2) ? bench_mpmc_producer : bench_mpmc_consumer,
+                                                &ctx[i], 0, NULL);
+        }
+        WaitForMultipleObjects(4, threads, 1, 120000);
+        t1 = now_seconds();
+        for (i = 0; i < 4; ++i) {
+            if (threads[i] != NULL) {
+                CloseHandle(threads[i]);
+                threads[i] = NULL;
+            }
+        }
+        sec[r] = t1 - t0;
+        if (sec[r] <= 0.0) {
+            sec[r] = 1e-9;
+        }
+        *sink ^= (uintptr_t)ef_queue_empty(db);
+        (void)ef_db_commit_meta(db);
+        ef_close(db);
+        db = NULL;
+        remove_test_file("bench_mpmc.endf");
+    }
+
+    bench_print_throughput("queue MPMC push+pop total", total_ops, mpmc_rounds, sec);
+}
+#endif
+
 static void run_perf_suite(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
     struct ef_slot *chase_cur;
     volatile uintptr_t sink = 0;
-    double samples[BENCH_ROUNDS];
+    double samples[BENCH_MAX_ROUNDS];
     double t0;
     double t1;
     int r;
@@ -1640,6 +1966,40 @@ static void run_perf_suite(struct ef_db *db)
         }
         bench_print_stats("write_payload + ef_sync (full)", sync_iters, BENCH_ROUNDS, samples);
     }
+#endif
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < pool_iters; ++i) {
+            err = ef_alloc_slot(db, &slot_id);
+            if (err == EF_OK) {
+                (void)ef_db_commit_meta(db);
+                sink ^= (uintptr_t)ef_free_slot(db, slot_id);
+            }
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)pool_iters * 1e9;
+    }
+    bench_print_stats("alloc+free + commit_meta each op", pool_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        int j;
+        for (j = 0; j < pool_iters; ++j) {
+            err = ef_alloc_slot(db, &slot_id);
+            if (err == EF_OK) {
+                sink ^= (uintptr_t)ef_free_slot(db, slot_id);
+            }
+        }
+        t0 = now_seconds();
+        sink ^= (uintptr_t)ef_db_commit_meta(db);
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) * 1e9;
+    }
+    bench_print_stats("ef_db_commit_meta (batch after 20k allocs)", 1, BENCH_ROUNDS, samples);
+
+    run_hash_perf_suite(&sink);
+#if EF_RUN_BENCH_MPMC && defined(_WIN32) && EF_HAS_FILE_IO
+    bench_mpmc_throughput(&sink);
 #endif
 
     (void)sink;

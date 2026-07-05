@@ -126,6 +126,7 @@ struct ef_db {
     uint32_t hash_capacity;
     struct ef_hash_entry *hash_index;
     int readonly;
+    uint8_t sb_meta_dirty;
 #ifdef _WIN32
     void *map_handle;
 #endif
@@ -209,6 +210,10 @@ enum ef_err ef_queue_pop(struct ef_db *db, void *buf, size_t buf_cap, size_t *ou
 int ef_queue_empty(const struct ef_db *db);
 
 void ef_db_refresh_slot_crcs(struct ef_db *db);
+
+/* Flush deferred superblock CRC (also runs inside ef_sync / ef_close). */
+enum ef_err ef_db_commit_meta(struct ef_db *db);
+void ef_db_mark_meta_dirty(struct ef_db *db);
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux);
 

@@ -106,6 +106,33 @@ static void ef_sb_checksum_store(struct ef_superblock *sb)
     }
 }
 
+void ef_db_mark_meta_dirty(struct ef_db *db)
+{
+    if (db == NULL || db->sb == NULL || db->readonly) {
+        return;
+    }
+    if (db->sb->flags & EF_FLAG_SB_CRC) {
+        db->sb_meta_dirty = 1;
+    }
+}
+
+enum ef_err ef_db_commit_meta(struct ef_db *db)
+{
+    if (db == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    if (db->sb == NULL || db->readonly) {
+        ef_set_error(db, EF_OK);
+        return EF_OK;
+    }
+    if (db->sb_meta_dirty) {
+        ef_sb_checksum_store(db->sb);
+        db->sb_meta_dirty = 0;
+    }
+    ef_set_error(db, EF_OK);
+    return EF_OK;
+}
+
 static int ef_sb_checksum_valid(const struct ef_superblock *sb)
 {
     uint32_t stored;
@@ -198,7 +225,7 @@ static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_o
                 --db->sb->free_count;
             }
             ef_slot_header_crc_store(db, slot_id, slot);
-            ef_sb_checksum_store(db->sb);
+            ef_db_mark_meta_dirty(db);
             *slot_id_out = slot_id;
             ef_set_error(db, EF_OK);
             return EF_OK;
@@ -233,7 +260,7 @@ static enum ef_err ef_free_list_push_atomic(struct ef_db *db, uint64_t slot_id, 
         if (EF_ATOMIC_CAS_U64(head_ptr, &exp, slot_offset)) {
             slot->status = EF_STATUS_FREE;
             ++db->sb->free_count;
-            ef_sb_checksum_store(db->sb);
+            ef_db_mark_meta_dirty(db);
             ef_set_error(db, EF_OK);
             return EF_OK;
         }
@@ -645,7 +672,7 @@ static enum ef_err ef_claim_slot(struct ef_db *db, uint64_t slot_id)
         --db->sb->free_count;
     }
     ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -921,6 +948,10 @@ void ef_close(struct ef_db *db)
         return;
     }
 
+    if (!db->readonly) {
+        (void)ef_db_commit_meta(db);
+    }
+
     ef_db_to_io(db, &io);
     ef_port_close(&io);
     free(db);
@@ -933,6 +964,11 @@ enum ef_err ef_sync_ex(struct ef_db *db, enum ef_sync_mode mode)
 
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
+    }
+
+    err = ef_db_commit_meta(db);
+    if (err != EF_OK) {
+        return err;
     }
 
     ef_db_to_io(db, &io);
@@ -1067,7 +1103,7 @@ static enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, st
     slot->header_crc = 0;
     memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
     ++db->sb->free_count;
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
     ef_set_error(db, EF_OK);
     return EF_OK;
 #endif
@@ -1544,7 +1580,7 @@ static enum ef_err ef_grow_append_slots(struct ef_db *db, uint64_t old_max, uint
         ++db->sb->free_count;
     }
 
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
     return EF_OK;
 }
 
@@ -2068,7 +2104,7 @@ enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out)
     memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
     --db->sb->free_count;
     ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
 
     *slot_id_out = slot_id;
     ef_set_error(db, EF_OK);
@@ -2197,7 +2233,7 @@ static enum ef_err ef_queue_dummy_offset(struct ef_db *db, uint64_t *dummy_offse
     if (EF_ATOMIC_CAS_U64(head_ptr, &exp, dummy_offset)) {
         EF_ATOMIC_STORE_U64(tail_ptr, dummy_offset);
         *dummy_offset_out = dummy_offset;
-        ef_sb_checksum_store(db->sb);
+        ef_db_mark_meta_dirty(db);
         return EF_OK;
     }
 
@@ -2294,7 +2330,7 @@ static enum ef_err ef_queue_enqueue_mpmc(struct ef_db *db, uint64_t slot_offset,
     ef_slot_header_crc_store(db, tail_id, tail_slot);
     EF_ATOMIC_STORE_U64(tail_ptr, slot_offset);
     ef_queue_lock_release(db);
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -2366,7 +2402,7 @@ static enum ef_err ef_queue_dequeue_mpmc(struct ef_db *db, void *buf, size_t buf
     }
     ef_slot_header_crc_store(db, dummy_id, dummy);
     ef_queue_lock_release(db);
-    ef_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
 
     if (stored_len > 0) {
         memcpy(buf, local + 1, stored_len);

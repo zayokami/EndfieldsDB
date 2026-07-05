@@ -1,5 +1,4 @@
 #include "ef_index.h"
-#include "ef_crc.h"
 #include "ef_port.h"
 
 #include <stddef.h>
@@ -250,24 +249,6 @@ static void ef_index_db_to_io(const struct ef_db *db, struct ef_io *io)
 }
 #endif
 
-static void ef_index_sb_checksum_store(struct ef_superblock *sb)
-{
-    uint32_t *crc_ptr;
-    uint32_t crc;
-    uint32_t zero_crc = 0;
-
-    if (!(sb->flags & EF_FLAG_SB_CRC)) {
-        return;
-    }
-
-    crc_ptr = (uint32_t *)&sb->reserved[0];
-    crc = ef_crc32_update(0xFFFFFFFFU, sb, offsetof(struct ef_superblock, reserved));
-    crc = ef_crc32_update(crc, &zero_crc, sizeof(zero_crc));
-    crc = ef_crc32_update(crc, sb->reserved + sizeof(uint32_t),
-                          sizeof(sb->reserved) - sizeof(uint32_t));
-    *crc_ptr = crc ^ 0xFFFFFFFFU;
-}
-
 static enum ef_err ef_index_remove_by_hash(struct ef_db *db, uint64_t key_hash)
 {
     uint32_t capacity;
@@ -459,7 +440,7 @@ enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
     }
 
     free(backup);
-    ef_index_sb_checksum_store(db->sb);
+    ef_db_mark_meta_dirty(db);
     ef_db_refresh_slot_crcs(db);
     return EF_OK;
 }

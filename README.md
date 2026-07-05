@@ -18,7 +18,7 @@
 - **只读打开**：`ef_open_readonly` 以只读 mmap 打开，写操作返回 `EF_ERR_READONLY`
 - **槽位迭代**：`ef_foreach_used` / `ef_slot_iter` 遍历已用头槽（跳过溢出续链槽与队列槽）
 - **溢出链 Blob**：`ef_write_blob` / `ef_read_blob` 支持超过 48 字节的大对象存储
-- **数据校验**（Schema v2+）：超级块 CRC32 + 已用/队列/溢出槽位头 CRC32
+- **数据校验**（Schema v2+）：超级块 CRC32 + 已用/队列/溢出槽位头 CRC32；超级块 CRC **延迟提交**（`ef_db_commit_meta` / `ef_sync` / `ef_close`）
 - **在线迁移**：`ef_needs_upgrade` / `ef_upgrade` 将 Schema v1 升级为 v2/v3（内联 payload 52→48 字节，尾部 4 字节丢弃）
 - **追逐热路径优化**：`ef_chase` / `ef_chase_n` 使用位移寻址，跳过逐跳 CRC（`ef_get_slot` 仍校验）
 - **多后端**：文件（POSIX / Win32）与纯内存（嵌入式 RAM arena）
@@ -209,6 +209,7 @@ key_hash (8) | slot_offset (8)
 | `ef_index_rehash` | 扩容哈希区、搬迁槽区、修正 free_list / queue / next_offset 后重插 |
 | `ef_index_remove_by_slot` | 按槽位物理偏移扫描并删除索引项 |
 | `ef_db_refresh_slot_crcs` | 刷新所有需 CRC 的槽头（rehash 后可选） |
+| `ef_db_commit_meta` | 立即刷新延迟的超级块 CRC（`ef_sync` / `ef_close` 亦会调用） |
 
 ## 许可证
 
