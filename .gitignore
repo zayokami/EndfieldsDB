@@ -1,0 +1,49 @@
+# Build outputs
+/build/
+/out/
+/cmake-build-*/
+
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# Test artifacts
+*.endf
+endfields_test
+endfields_embedded_test
+
+# Scratch / local-only
+_gcc_test.c
+
+# IDE & editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+test_out*.txt
