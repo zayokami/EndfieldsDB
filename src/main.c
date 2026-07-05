@@ -1327,6 +1327,7 @@ static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
 static void run_perf_suite(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
+    struct ef_slot *chase_cur;
     volatile uintptr_t sink = 0;
     double samples[BENCH_ROUNDS];
     double t0;
@@ -1338,12 +1339,28 @@ static void run_perf_suite(struct ef_db *db)
     const int write_iters = 50000;
     const int sync_iters = 500;
     const int hop_iters = 100000;
+    const int pool_iters = 20000;
+    const int queue_iters = 20000;
     uint64_t slot_id = 7;
+    enum ef_err err;
+    char qbuf[48];
+    size_t qlen;
 
     printf("\n=== Performance suite (%d rounds each, platform=%s) ===\n",
            BENCH_ROUNDS, ef_platform_name());
 
     bench_prepare_chain(db, 32);
+
+    chase_cur = ef_get_slot(db, 0);
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < fast_iters; ++i) {
+            sink ^= (uintptr_t)ef_chase(db, chase_cur);
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)fast_iters * 1e9;
+    }
+    bench_print_stats("ef_chase direct 1-hop", fast_iters, BENCH_ROUNDS, samples);
 
     for (r = 0; r < BENCH_ROUNDS; ++r) {
         chase_cmd.opcode = EF_OP_CHASE;
@@ -1356,7 +1373,7 @@ static void run_perf_suite(struct ef_db *db)
         t1 = now_seconds();
         samples[r] = (t1 - t0) / (double)fast_iters * 1e9;
     }
-    bench_print_stats("fast chase 1-hop (no CRC)", fast_iters, BENCH_ROUNDS, samples);
+    bench_print_stats("ef_execute CHASE 1-hop", fast_iters, BENCH_ROUNDS, samples);
 
     for (r = 0; r < BENCH_ROUNDS; ++r) {
         t0 = now_seconds();
@@ -1401,7 +1418,35 @@ static void run_perf_suite(struct ef_db *db)
         t1 = now_seconds();
         samples[r] = (t1 - t0) / (double)write_iters * 1e9;
     }
-    bench_print_stats("ef_write_payload (CRC+sb)", write_iters, BENCH_ROUNDS, samples);
+    bench_print_stats("ef_write_payload (slot CRC)", write_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < pool_iters; ++i) {
+            err = ef_alloc_slot(db, &slot_id);
+            if (err == EF_OK) {
+                sink ^= (uintptr_t)ef_free_slot(db, slot_id);
+            }
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)pool_iters * 1e9;
+    }
+    bench_print_stats("ef_alloc_slot + ef_free_slot", pool_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < queue_iters; ++i) {
+            snprintf(qbuf, sizeof(qbuf), "q-%d", i);
+            err = ef_queue_push(db, qbuf, (uint8_t)strlen(qbuf));
+            if (err == EF_OK) {
+                err = ef_queue_pop(db, qbuf, sizeof(qbuf), &qlen);
+            }
+            sink ^= (uintptr_t)err;
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)queue_iters * 1e9;
+    }
+    bench_print_stats("ef_queue_push + pop roundtrip", queue_iters, BENCH_ROUNDS, samples);
 
 #if EF_HAS_FILE_IO
     if (db->backend == EF_BACKEND_FILE) {

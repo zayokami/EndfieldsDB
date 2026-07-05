@@ -45,10 +45,14 @@ static const uint32_t *ef_sb_checksum_ptr_ro(const struct ef_superblock *sb)
 
 static uint32_t ef_sb_checksum_compute(const struct ef_superblock *sb)
 {
-    uint8_t block[sizeof(struct ef_superblock)];
-    memcpy(block, sb, sizeof(block));
-    memset(block + offsetof(struct ef_superblock, reserved), 0, sizeof(uint32_t));
-    return ef_crc32(block, sizeof(block));
+    uint32_t crc;
+    uint32_t zero_crc = 0;
+
+    crc = ef_crc32_update(0xFFFFFFFFU, sb, offsetof(struct ef_superblock, reserved));
+    crc = ef_crc32_update(crc, &zero_crc, sizeof(zero_crc));
+    crc = ef_crc32_update(crc, sb->reserved + sizeof(uint32_t),
+                          sizeof(sb->reserved) - sizeof(uint32_t));
+    return crc ^ 0xFFFFFFFFU;
 }
 
 static void ef_sb_checksum_store(struct ef_superblock *sb)
@@ -78,14 +82,24 @@ static int ef_sb_checksum_valid(const struct ef_superblock *sb)
 
 static uint32_t ef_slot_header_crc_compute(uint64_t slot_id, const struct ef_slot *slot)
 {
-    uint8_t block[sizeof(uint64_t) + sizeof(struct ef_slot)];
-    struct ef_slot temp;
+    uint32_t crc;
 
-    memcpy(&temp, slot, sizeof(temp));
-    temp.header_crc = 0;
-    memcpy(block, &slot_id, sizeof(slot_id));
-    memcpy(block + sizeof(slot_id), &temp, sizeof(temp));
-    return ef_crc32(block, sizeof(block));
+    crc = ef_crc32_update(0xFFFFFFFFU, &slot_id, sizeof(slot_id));
+    crc = ef_crc32_update(crc, &slot->status, sizeof(slot->status));
+    crc = ef_crc32_update(crc, slot->payload, sizeof(slot->payload));
+    crc = ef_crc32_update(crc, &slot->next_offset, sizeof(slot->next_offset));
+    return crc ^ 0xFFFFFFFFU;
+}
+
+static struct ef_slot *ef_slot_by_id(struct ef_db *db, uint64_t slot_id)
+{
+    if (db == NULL || db->sb == NULL || db->slots == NULL) {
+        return NULL;
+    }
+    if (EF_UNLIKELY(slot_id >= db->sb->max_slots)) {
+        return NULL;
+    }
+    return db->slots + slot_id;
 }
 
 static void ef_slot_header_crc_store(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot)
@@ -455,12 +469,14 @@ static enum ef_err ef_claim_slot(struct ef_db *db, uint64_t slot_id)
     struct ef_slot *slot;
     enum ef_err err;
 
-    slot = ef_get_slot(db, slot_id);
+    slot = ef_slot_by_id(db, slot_id);
     if (slot == NULL) {
-        return ef_last_error(db);
+        ef_set_error(db, EF_ERR_SLOT_ID);
+        return EF_ERR_SLOT_ID;
     }
 
     if (slot->status == EF_STATUS_USED) {
+        ef_set_error(db, EF_OK);
         return EF_OK;
     }
 
@@ -925,7 +941,6 @@ static enum ef_err ef_blob_free_overflow_chain(struct ef_db *db, uint64_t head_i
     offset = head->next_offset;
     head->next_offset = 0;
     ef_slot_header_crc_store(db, head_id, head);
-    ef_sb_checksum_store(db->sb);
 
     while (offset != 0) {
         uint64_t slot_id;
@@ -1055,7 +1070,6 @@ enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, 
                 }
                 memset((uint8_t *)ef_slot_payload_ptr(db, head) + EF_BLOB_HDR_SIZE, 0, inline_cap);
                 ef_slot_header_crc_store(db, slot_id, head);
-                ef_sb_checksum_store(db->sb);
                 return err;
             }
 
@@ -1077,7 +1091,6 @@ enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, 
 
     head->status = EF_STATUS_USED;
     ef_slot_header_crc_store(db, slot_id, head);
-    ef_sb_checksum_store(db->sb);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -1521,12 +1534,16 @@ struct ef_slot *ef_chase(struct ef_db *db, struct ef_slot *current_slot)
         ef_set_error(db, EF_ERR_OFFSET);
         return NULL;
     }
-
-    next_slot = ef_slot_at_offset(db, next_offset, NULL);
-    if (next_slot == NULL) {
+    if (EF_UNLIKELY(next_offset < db->slots_base || next_offset >= db->file_size)) {
         ef_set_error(db, EF_ERR_OFFSET);
         return NULL;
     }
+    if (EF_UNLIKELY((next_offset - db->slots_base) & EF_SLOT_MASK)) {
+        ef_set_error(db, EF_ERR_OFFSET);
+        return NULL;
+    }
+
+    next_slot = (struct ef_slot *)((uint8_t *)db->mmap_addr + next_offset);
     if (EF_UNLIKELY(next_slot->status != EF_STATUS_USED)) {
         ef_set_error(db, EF_ERR_SLOT_FREE);
         return NULL;
@@ -1568,6 +1585,15 @@ struct ef_slot *ef_chase_n(struct ef_db *db, uint64_t start_offset, uint32_t hop
         limit = EF_CHASE_MAX_DEPTH;
     }
 
+    if (EF_UNLIKELY(start_offset < db->slots_base || start_offset >= db->file_size)) {
+        ef_set_error(db, EF_ERR_OFFSET);
+        return NULL;
+    }
+    if (EF_UNLIKELY((start_offset - db->slots_base) & EF_SLOT_MASK)) {
+        ef_set_error(db, EF_ERR_OFFSET);
+        return NULL;
+    }
+
     offset = start_offset;
     slot = NULL;
 
@@ -1580,11 +1606,7 @@ struct ef_slot *ef_chase_n(struct ef_db *db, uint64_t start_offset, uint32_t hop
             seen[seen_count++] = offset;
         }
 
-        slot = ef_slot_at_offset(db, offset, NULL);
-        if (slot == NULL) {
-            ef_set_error(db, EF_ERR_OFFSET);
-            return NULL;
-        }
+        slot = (struct ef_slot *)((uint8_t *)db->mmap_addr + offset);
         if (EF_UNLIKELY(slot->status != EF_STATUS_USED)) {
             ef_set_error(db, EF_ERR_SLOT_FREE);
             return NULL;
@@ -1607,7 +1629,7 @@ struct ef_slot *ef_chase_n(struct ef_db *db, uint64_t start_offset, uint32_t hop
         return NULL;
     }
 
-    slot = ef_slot_at_offset(db, offset, NULL);
+    slot = (struct ef_slot *)((uint8_t *)db->mmap_addr + offset);
     if (hops_done_out != NULL) {
         *hops_done_out = limit;
     }
@@ -1628,10 +1650,12 @@ static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id)
     struct ef_slot *slot;
     struct ef_slot *cursor;
     uint64_t slot_offset;
+    uint64_t guard;
+    uint64_t max_guard;
 
-    slot = ef_get_slot(db, slot_id);
+    slot = ef_slot_by_id(db, slot_id);
     if (slot == NULL) {
-        return ef_last_error(db);
+        return EF_ERR_SLOT_ID;
     }
     if (slot->status != EF_STATUS_FREE) {
         return EF_OK;
@@ -1644,14 +1668,17 @@ static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id)
         return EF_OK;
     }
 
-    cursor = (struct ef_slot *)ef_offset_to_ptr(db, db->sb->free_list_head);
-    while (cursor != NULL) {
+    cursor = ef_slot_at_offset(db, db->sb->free_list_head, NULL);
+    max_guard = db->sb->max_slots + 1U;
+    guard = 0;
+    while (cursor != NULL && guard < max_guard) {
+        ++guard;
         if (cursor->next_offset == slot_offset) {
             cursor->next_offset = slot->next_offset;
             slot->next_offset = 0;
             return EF_OK;
         }
-        cursor = (struct ef_slot *)ef_offset_to_ptr(db, cursor->next_offset);
+        cursor = ef_slot_at_offset(db, cursor->next_offset, NULL);
     }
 
     return EF_ERR_NOT_FOUND;
@@ -1667,9 +1694,10 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
         return err;
     }
 
-    slot = ef_get_slot(db, slot_id);
+    slot = ef_slot_by_id(db, slot_id);
     if (slot == NULL) {
-        return ef_last_error(db);
+        ef_set_error(db, EF_ERR_SLOT_ID);
+        return EF_ERR_SLOT_ID;
     }
 
     if (status == EF_STATUS_FREE) {
@@ -1680,16 +1708,26 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
         return ef_free_slot(db, slot_id);
     }
 
-    if (status == EF_STATUS_USED && slot->status == EF_STATUS_FREE) {
-        err = ef_claim_slot(db, slot_id);
-        if (err != EF_OK) {
-            return err;
+    if (status == EF_STATUS_USED) {
+        if (slot->status == EF_STATUS_FREE) {
+            return ef_claim_slot(db, slot_id);
         }
+        if (slot->status == EF_STATUS_USED) {
+            ef_set_error(db, EF_OK);
+            return EF_OK;
+        }
+        slot->status = EF_STATUS_USED;
+        ef_slot_header_crc_store(db, slot_id, slot);
+        ef_set_error(db, EF_OK);
+        return EF_OK;
     }
 
-    slot->status = EF_STATUS_USED;
-    ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
+    slot->status = status;
+    if (ef_slot_status_has_crc(status)) {
+        ef_slot_header_crc_store(db, slot_id, slot);
+    } else {
+        slot->header_crc = 0;
+    }
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -1728,7 +1766,6 @@ enum ef_err ef_set_next_offset(struct ef_db *db, uint64_t slot_id, uint64_t next
 
     slot->next_offset = next_offset;
     ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -1760,16 +1797,23 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
         return EF_ERR_PAYLOAD_LEN;
     }
 
-    slot = ef_get_slot(db, slot_id);
+    slot = ef_slot_by_id(db, slot_id);
     if (slot == NULL) {
-        return ef_last_error(db);
+        ef_set_error(db, EF_ERR_SLOT_ID);
+        return EF_ERR_SLOT_ID;
     }
+
     if (slot->status == EF_STATUS_FREE) {
         err = ef_claim_slot(db, slot_id);
         if (err != EF_OK) {
             return err;
         }
-        slot = ef_get_slot(db, slot_id);
+        slot = ef_slot_by_id(db, slot_id);
+    } else if (ef_slot_status_has_crc(slot->status)) {
+        if (!ef_slot_header_crc_valid(db, slot_id, slot)) {
+            ef_set_error(db, EF_ERR_BAD_CHECKSUM);
+            return EF_ERR_BAD_CHECKSUM;
+        }
     }
 
     payload = ef_slot_payload_ptr(db, slot);
@@ -1786,7 +1830,6 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
     }
     slot->status = EF_STATUS_USED;
     ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -1815,7 +1858,6 @@ enum ef_err ef_write_field(struct ef_db *db, uint64_t slot_id, uint8_t field_off
 
     *field = value;
     ef_slot_header_crc_store(db, slot_id, slot);
-    ef_sb_checksum_store(db->sb);
     ef_set_error(db, EF_OK);
     return EF_OK;
 }

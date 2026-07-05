@@ -23,35 +23,33 @@ static void ef_crc32_init_table(void)
     ef_crc32_table_init = 1;
 }
 
-uint32_t ef_crc32(const void *data, size_t len)
+static void ef_crc32_ensure_init(void)
 {
-    const uint8_t *bytes = (const uint8_t *)data;
-    uint32_t crc = 0xFFFFFFFFU;
-    size_t i;
-
     if (!ef_crc32_table_init) {
         ef_crc32_init_table();
     }
-
-    for (i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ ef_crc32_table[(crc ^ bytes[i]) & 0xFFU];
-    }
-
-    return crc ^ 0xFFFFFFFFU;
 }
 
-uint32_t ef_crc32_combine(uint32_t crc, const void *data, size_t len)
+uint32_t ef_crc32_update(uint32_t crc, const void *data, size_t len)
 {
     const uint8_t *bytes = (const uint8_t *)data;
     size_t i;
 
-    if (!ef_crc32_table_init) {
-        ef_crc32_init_table();
-    }
+    ef_crc32_ensure_init();
 
     for (i = 0; i < len; ++i) {
         crc = (crc >> 8) ^ ef_crc32_table[(crc ^ bytes[i]) & 0xFFU];
     }
 
     return crc;
+}
+
+uint32_t ef_crc32(const void *data, size_t len)
+{
+    return ef_crc32_update(0xFFFFFFFFU, data, len) ^ 0xFFFFFFFFU;
+}
+
+uint32_t ef_crc32_combine(uint32_t crc, const void *data, size_t len)
+{
+    return ef_crc32_update(crc, data, len);
 }
