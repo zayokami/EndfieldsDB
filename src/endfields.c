@@ -2401,6 +2401,7 @@ static enum ef_err ef_queue_dequeue_mpmc(struct ef_db *db, void *buf, size_t buf
         EF_ATOMIC_STORE_U64(tail_ptr, first_next != 0 ? first_next : dummy_offset);
     }
     ef_slot_header_crc_store(db, dummy_id, dummy);
+    err = ef_return_slot_to_pool(db, first_id, first);
     ef_queue_lock_release(db);
     ef_db_mark_meta_dirty(db);
 
@@ -2408,7 +2409,6 @@ static enum ef_err ef_queue_dequeue_mpmc(struct ef_db *db, void *buf, size_t buf
         memcpy(buf, local + 1, stored_len);
     }
     *out_len = stored_len;
-    err = ef_return_slot_to_pool(db, first_id, first);
     ef_set_error(db, err);
     return err;
 }
@@ -2463,7 +2463,7 @@ enum ef_err ef_queue_push(struct ef_db *db, const void *data, uint8_t len)
 
     err = ef_queue_enqueue_mpmc(db, ef_slot_to_offset(db, slot_id), slot_id);
     if (err != EF_OK) {
-        (void)ef_free_slot(db, slot_id);
+        (void)ef_return_slot_to_pool(db, slot_id, slot);
     }
     return err;
 }
@@ -2506,6 +2506,41 @@ int ef_queue_empty(const struct ef_db *db)
     }
 
     return EF_ATOMIC_LOAD_U64((volatile uint64_t *)&dummy->next_offset) == 0;
+}
+
+int ef_queue_drained(struct ef_db *db)
+{
+    volatile uint64_t *head_ptr;
+    uint64_t dummy_offset;
+    struct ef_slot *dummy;
+    uint64_t dummy_id;
+    enum ef_err err;
+    int drained;
+
+    if (db == NULL || db->sb == NULL) {
+        return 1;
+    }
+
+    head_ptr = (volatile uint64_t *)ef_sb_queue_head_ptr(db->sb);
+    dummy_offset = EF_ATOMIC_LOAD_U64(head_ptr);
+    if (dummy_offset == 0) {
+        return 1;
+    }
+
+    err = ef_queue_lock_acquire(db);
+    if (err != EF_OK) {
+        return 0;
+    }
+
+    dummy = ef_slot_at_offset(db, dummy_offset, &dummy_id);
+    if (dummy == NULL || dummy->status != EF_STATUS_QUEUE_DUMMY) {
+        ef_queue_lock_release(db);
+        return 0;
+    }
+
+    drained = (dummy->next_offset == 0);
+    ef_queue_lock_release(db);
+    return drained;
 }
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)

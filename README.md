@@ -10,7 +10,7 @@
 - **指针追逐**：单跳 `ef_chase`、多跳 `ef_chase_n`，带环检测与可选 CPU prefetch
 - **槽位池**：持久化 LIFO 空闲链表（`ef_alloc_slot` / `ef_free_slot`），复用 `next_offset`，无额外元数据开销
 - **尾部自动扩容**（v3）：`ef_alloc` 在空闲链耗尽时 `ef_grow(+1)` 追加槽位
-- **跨进程 MPMC 队列**（v3）：`ef_queue_push` / `ef_queue_pop`，dummy 头节点 + 共享自旋锁，多生产者/多消费者安全；空闲链 CAS 弹入/弹出支持并发分配
+- **跨进程 MPMC 队列**（v3）：`ef_queue_push` / `ef_queue_pop`，dummy 头节点 + 共享自旋锁，多生产者/多消费者安全；出队在锁内归还槽位，空闲链 CAS 弹入/弹出支持并发分配
 - **Robin Hood 哈希索引**（v3）：`ef_index_put` / `ef_index_get`，字符串键直达槽位，装载率可达 90%+
 - **索引生命周期**（v3）：`ef_free_slot` 自动 `ef_index_remove_by_slot`；`ef_index_rehash` 扩容哈希区并搬迁槽区、修正所有物理偏移
 - **紧凑指令集**：`ef_execute` 通过 10 字节 `ef_cmd` 派发读写、追逐、分配等操作
@@ -79,7 +79,9 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 - `test_slot_header_crc_*` — 头 CRC / 溢出槽 CRC 篡改、`ef_foreach_used` / `ef_slot_iter` 中止、磁盘篡改后只读打开拒绝
 - `test_v3_alloc_queue_index` — 尾部 grow 分配、FIFO 队列往返、Robin Hood 索引 put/get/remove、队列持久化重开
 - `test_index_lifecycle_and_rehash` — 索引 put → rehash 16→32 → free 后 get 应 NOT_FOUND
-- `test_queue_mpmc` — Windows 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次
+- `test_queue_mpmc` — Windows 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次；消费者用 `ef_queue_drained` 在锁下确认排空后退出
+
+性能套件（`main.c`）另含 **MPMC 吞吐 bench**（5 轮 × 4 线程 × 4000 消息），槽位池按 `消息数 + 64` 预分配以避免高并发下槽位耗尽。
 
 ## 快速示例
 
@@ -107,6 +109,9 @@ if (db) {
     char buf[64];
     size_t n;
     ef_queue_pop(db, buf, sizeof(buf), &n);
+
+    /* 多线程消费者：生产者全部结束后，在锁下确认队列已排空 */
+    if (ef_queue_drained(db)) { /* safe to shut down workers */ }
 
     /* 哈希表扩容（new_capacity 须为 2 的幂且 > 当前容量） */
     ef_index_rehash(db, 512);
@@ -189,11 +194,15 @@ key_hash (8) | slot_offset (8)
 
 队列槽 `payload` 布局：`[1 字节长度][数据…]`，最大数据 **47 字节**（`len` 参数为数据长度，不含长度前缀）。
 
-首次 `ef_queue_push` 惰性分配 dummy 哨兵槽；逻辑空队列为 `dummy.next_offset == 0`（`ef_queue_empty`）。
+首次 `ef_queue_push` 惰性分配 dummy 哨兵槽；逻辑空队列为 `dummy.next_offset == 0`（`ef_queue_empty`，无锁快路径）。
+
+`ef_queue_drained` 在持有 `queue_lock` 时检查是否无待处理消息，适合多线程消费者在「所有生产者已结束」后安全退出（`ef_queue_empty` 仅作启发式判断，高并发下可能误判）。
 
 并发语义：
 
 - 入队/出队临界区由超级块 `queue_lock` 自旋锁保护（GCC/Clang `__atomic` CAS）
+- 出队摘链后在**同一临界区内**调用 `ef_return_slot_to_pool`，避免槽位被并发复用时尚未脱离队列生命周期
+- 入队失败（如 `EF_ERR_QUEUE_BUSY`）时通过 `ef_return_slot_to_pool` 回收已分配槽（`ef_free_slot` 无法释放 `QUEUED` 状态）
 - 空闲链在支持原子操作的平台使用 CAS 栈式弹入/弹出，与队列并发安全
 - 高争用返回 `EF_ERR_QUEUE_BUSY`，调用方应重试
 
@@ -208,6 +217,8 @@ key_hash (8) | slot_offset (8)
 | `ef_free_slot` | 归还空闲链并清除索引项（队列槽须先 `ef_queue_pop`） |
 | `ef_index_rehash` | 扩容哈希区、搬迁槽区、修正 free_list / queue / next_offset 后重插 |
 | `ef_index_remove_by_slot` | 按槽位物理偏移扫描并删除索引项 |
+| `ef_queue_empty` | 无锁快路径：dummy 未分配或 `dummy.next == 0` |
+| `ef_queue_drained` | 持锁检查队列无待处理消息（多线程消费者退出用） |
 | `ef_db_refresh_slot_crcs` | 刷新所有需 CRC 的槽头（rehash 后可选） |
 | `ef_db_commit_meta` | 立即刷新延迟的超级块 CRC（`ef_sync` / `ef_close` 亦会调用） |
 

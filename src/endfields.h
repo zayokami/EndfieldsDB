@@ -208,6 +208,8 @@ enum ef_err ef_alloc(struct ef_db *db, uint64_t *slot_id_out);
 enum ef_err ef_queue_push(struct ef_db *db, const void *data, uint8_t len);
 enum ef_err ef_queue_pop(struct ef_db *db, void *buf, size_t buf_cap, size_t *out_len);
 int ef_queue_empty(const struct ef_db *db);
+/* True when the queue has no pending messages (checked under the queue lock). */
+int ef_queue_drained(struct ef_db *db);
 
 void ef_db_refresh_slot_crcs(struct ef_db *db);
 
