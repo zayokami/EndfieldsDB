@@ -29,7 +29,59 @@ static void ef_sb_index_yield(uint32_t spins)
 #endif
 }
 
-#if !defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
+static uint8_t ef_atomic_load_u8(const volatile void *ptr)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    const volatile void *word_ptr = (const volatile void *)(addr - align_off);
+    uint32_t word = ef_atomic_load_u32(word_ptr);
+
+    return (uint8_t)((word >> (align_off * 8U)) & 0xFFU);
+}
+
+static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    volatile void *word_ptr = (volatile void *)(addr - align_off);
+    uint32_t exp_word;
+    uint32_t des_word;
+
+    exp_word = ef_atomic_load_u32((const void *)word_ptr);
+    for (;;) {
+        des_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
+                   ((uint32_t)value << (align_off * 8U));
+        if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
+            return;
+        }
+    }
+}
+
+static int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desired)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    volatile void *word_ptr = (volatile void *)(addr - align_off);
+    uint32_t exp_word;
+    uint32_t des_word;
+
+    exp_word = ef_atomic_load_u32((const void *)word_ptr);
+    for (;;) {
+        uint8_t cur_byte = (uint8_t)((exp_word >> (align_off * 8U)) & 0xFFU);
+
+        if (cur_byte != *expected) {
+            *expected = cur_byte;
+            return 0;
+        }
+        des_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
+                   ((uint32_t)desired << (align_off * 8U));
+        if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
+            return 1;
+        }
+    }
+}
+#else
 static uint8_t ef_atomic_load_u8(const volatile void *ptr)
 {
     uint8_t value;
@@ -38,7 +90,6 @@ static uint8_t ef_atomic_load_u8(const volatile void *ptr)
     EF_ATOMIC_THREAD_FENCE();
     return value;
 }
-#endif
 
 static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 {
@@ -48,47 +99,24 @@ static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 
 static int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desired)
 {
-    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
-        uint32_t cur_word;
-        uint32_t exp_word;
-        uint32_t des_word;
-        uintptr_t addr = (uintptr_t)ptr;
-        uintptr_t align_off = addr & (uintptr_t)3U;
-        volatile void *word_ptr = (volatile void *)(addr - align_off);
+    uint8_t cur;
 
-        memcpy(&cur_word, (const void *)word_ptr, sizeof(cur_word));
-        exp_word = cur_word;
-        des_word = cur_word;
-        exp_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
-                   ((uint32_t)*expected << (align_off * 8U));
-        des_word = (des_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
-                   ((uint32_t)desired << (align_off * 8U));
-        if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
+    for (;;) {
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur != *expected) {
+            *expected = cur;
+            return 0;
+        }
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        EF_ATOMIC_THREAD_FENCE();
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur == desired) {
             return 1;
         }
-        *expected = (uint8_t)((exp_word >> (align_off * 8U)) & 0xFFU);
-        return 0;
-    }
-
-    {
-        uint8_t cur;
-
-        for (;;) {
-            memcpy(&cur, (const void *)ptr, sizeof(cur));
-            if (cur != *expected) {
-                *expected = cur;
-                return 0;
-            }
-            memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
-            EF_ATOMIC_THREAD_FENCE();
-            memcpy(&cur, (const void *)ptr, sizeof(cur));
-            if (cur == desired) {
-                return 1;
-            }
-            *expected = cur;
-        }
+        *expected = cur;
     }
 }
+#endif
 
 static volatile uint8_t *ef_sb_queue_lock_byte(struct ef_superblock *sb)
 {
