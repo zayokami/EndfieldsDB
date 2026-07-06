@@ -94,8 +94,10 @@ jobs:
       - name: Capture coverage
         run: |
           set -euo pipefail
-          lcov --directory build --capture --output-file coverage.raw.info --rc branch_coverage=0
-          lcov --remove coverage.raw.info '/usr/*' '*/build/*' --output-file coverage.info
+          lcov --directory build --capture --output-file coverage.info \
+            --rc branch_coverage=0 \
+            --rc geninfo_unexecuted_blocks=1 \
+            --ignore-errors gcov,gcov
           genhtml coverage.info --output-directory build/coverage-html --quiet
           lcov --summary coverage.info
 
