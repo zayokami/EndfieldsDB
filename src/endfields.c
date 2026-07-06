@@ -38,6 +38,25 @@
 #define EF_ATOMIC_THREAD_FENCE() ((void)0)
 #endif
 
+/* struct ef_slot is packed; avoid __atomic_* on &slot->next_offset (Clang -Watomic-alignment). */
+static uint64_t ef_slot_u64_load(const struct ef_slot *slot, size_t member_offset)
+{
+    const unsigned char *base;
+    uint64_t value;
+
+    base = (const unsigned char *)slot + member_offset;
+    memcpy(&value, base, sizeof(value));
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+    return value;
+}
+
+static uint64_t ef_slot_next_offset_load(const struct ef_slot *slot)
+{
+    return ef_slot_u64_load(slot, offsetof(struct ef_slot, next_offset));
+}
+
 #define EF_QUEUE_SPIN_MAX 65536U
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -215,7 +234,7 @@ static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_o
             return err;
         }
 
-        next = EF_ATOMIC_LOAD_U64((volatile uint64_t *)&slot->next_offset);
+        next = ef_slot_next_offset_load(slot);
         exp = head;
         if (EF_ATOMIC_CAS_U64(head_ptr, &exp, next)) {
             slot->next_offset = 0;
@@ -2505,7 +2524,7 @@ int ef_queue_empty(const struct ef_db *db)
         return EF_ATOMIC_LOAD_U64((volatile uint64_t *)ef_sb_queue_head_ptr_ro(sb)) == 0;
     }
 
-    return EF_ATOMIC_LOAD_U64((volatile uint64_t *)&dummy->next_offset) == 0;
+    return ef_slot_next_offset_load(dummy) == 0;
 }
 
 int ef_queue_drained(struct ef_db *db)
