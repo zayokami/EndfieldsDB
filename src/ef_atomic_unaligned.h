@@ -316,6 +316,41 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
     *p = desired;
     return 1;
 }
+
+static inline uint8_t ef_atomic_load_u8(const volatile void *ptr)
+{
+    uint8_t value;
+
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    EF_ATOMIC_THREAD_FENCE();
+    return value;
+}
+
+static inline void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
+{
+    EF_ATOMIC_THREAD_FENCE();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static inline int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desired)
+{
+    uint8_t cur;
+
+    for (;;) {
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur != *expected) {
+            *expected = cur;
+            return 0;
+        }
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        EF_ATOMIC_THREAD_FENCE();
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur == desired) {
+            return 1;
+        }
+        *expected = cur;
+    }
+}
 #endif
 
 #if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
@@ -373,6 +408,30 @@ static inline void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
                    ((uint32_t)value << (align_off * 8U));
         if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
             return;
+        }
+    }
+}
+
+static inline int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desired)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    volatile void *word_ptr = (volatile void *)(addr - align_off);
+    uint32_t exp_word;
+    uint32_t des_word;
+
+    exp_word = ef_atomic_load_u32((const void *)word_ptr);
+    for (;;) {
+        uint8_t cur_byte = (uint8_t)((exp_word >> (align_off * 8U)) & 0xFFU);
+
+        if (cur_byte != *expected) {
+            *expected = cur_byte;
+            return 0;
+        }
+        des_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
+                   ((uint32_t)desired << (align_off * 8U));
+        if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
+            return 1;
         }
     }
 }
