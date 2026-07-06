@@ -29,6 +29,7 @@ static void ef_sb_index_yield(uint32_t spins)
 #endif
 }
 
+#if !defined(__GNUC__) && !defined(__clang__)
 static uint8_t ef_atomic_load_u8(const volatile void *ptr)
 {
     uint8_t value;
@@ -37,6 +38,7 @@ static uint8_t ef_atomic_load_u8(const volatile void *ptr)
     EF_ATOMIC_THREAD_FENCE();
     return value;
 }
+#endif
 
 static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 {
@@ -54,7 +56,7 @@ static int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desir
         uintptr_t align_off = addr & (uintptr_t)3U;
         volatile void *word_ptr = (volatile void *)(addr - align_off);
 
-        memcpy(&cur_word, word_ptr, sizeof(cur_word));
+        memcpy(&cur_word, (const void *)word_ptr, sizeof(cur_word));
         exp_word = cur_word;
         des_word = cur_word;
         exp_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
@@ -202,7 +204,7 @@ enum ef_err ef_sb_queue_lock_acquire(struct ef_superblock *sb)
             }
             ef_sb_index_yield(spins);
             exp32 = 0;
-            if (EF_ATOMIC_CAS_U32(lock32, &exp32, 1U)) {
+            if (ef_atomic_cas_u32((volatile void *)lock32, &exp32, 1U)) {
                 return EF_OK;
             }
         }
@@ -243,7 +245,7 @@ void ef_sb_queue_lock_release(struct ef_superblock *sb)
     }
 
     if (!ef_sb_uses_v4_index_layout(sb)) {
-        EF_ATOMIC_STORE_U32((volatile void *)&sb->reserved[EF_SB_OFF_QUEUE_LOCK_V3], 0U);
+        ef_atomic_store_u32((volatile void *)&sb->reserved[EF_SB_OFF_QUEUE_LOCK_V3], 0U);
         return;
     }
 
@@ -299,7 +301,7 @@ uint32_t ef_sb_index_seq_load(const struct ef_superblock *sb)
         return 0;
     }
 
-    return ef_atomic_load_u32((const void *)ef_sb_index_seq_ptr(sb));
+    return ef_atomic_load_u32((const void *)&sb->reserved[EF_SB_OFF_INDEX_SEQ]);
 }
 
 void ef_sb_index_write_seq_begin(struct ef_superblock *sb)
