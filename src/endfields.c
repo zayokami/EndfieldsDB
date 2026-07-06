@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -21,16 +22,90 @@
 #define EF_SB_OFF_QUEUE_LOCK 24U
 
 #if defined(__GNUC__) || defined(__clang__)
-#define EF_ATOMIC_LOAD_U32(p)  __atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define EF_ATOMIC_STORE_U32(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+static uint32_t ef_atomic_load_u32(const volatile void *ptr)
+{
+    uint32_t value;
+
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return value;
+}
+
+static void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
+{
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
+{
+    uint32_t cur;
+
+    for (;;) {
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur != *expected) {
+            *expected = cur;
+            return 0;
+        }
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur == desired) {
+            return 1;
+        }
+        *expected = cur;
+    }
+}
+
+static uint64_t ef_atomic_load_u64(const volatile void *ptr)
+{
+    uint64_t value;
+
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return value;
+}
+
+static void ef_atomic_store_u64(volatile void *ptr, uint64_t value)
+{
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t desired)
+{
+    uint64_t cur;
+
+    for (;;) {
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur != *expected) {
+            *expected = cur;
+            return 0;
+        }
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(&cur, (const void *)ptr, sizeof(cur));
+        if (cur == desired) {
+            return 1;
+        }
+        *expected = cur;
+    }
+}
+
+#define EF_ATOMIC_LOAD_U32(p)  ef_atomic_load_u32((const volatile void *)(p))
+#define EF_ATOMIC_STORE_U32(p, v) ef_atomic_store_u32((volatile void *)(p), (v))
 #define EF_ATOMIC_CAS_U32(p, expected, desired) \
-    __atomic_compare_exchange_n((p), (expected), (desired), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-#define EF_ATOMIC_LOAD_U64(p)  __atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define EF_ATOMIC_STORE_U64(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+    ef_atomic_cas_u32((volatile void *)(p), (expected), (desired))
+#define EF_ATOMIC_LOAD_U64(p)  ef_atomic_load_u64((const volatile void *)(p))
+#define EF_ATOMIC_STORE_U64(p, v) ef_atomic_store_u64((volatile void *)(p), (v))
 #define EF_ATOMIC_CAS_U64(p, expected, desired) \
-    __atomic_compare_exchange_n((p), (expected), (desired), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+    ef_atomic_cas_u64((volatile void *)(p), (expected), (desired))
 #define EF_ATOMIC_THREAD_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #else
+#define EF_ATOMIC_LOAD_U32(p)  (*(p))
+#define EF_ATOMIC_STORE_U32(p, v) (*(p) = (v))
+#define EF_ATOMIC_CAS_U32(p, expected, desired) \
+    ((*(expected) == *(p)) ? ((*(p) = (desired)), 1) : 0)
 #define EF_ATOMIC_LOAD_U64(p)  (*(p))
 #define EF_ATOMIC_STORE_U64(p, v) (*(p) = (v))
 #define EF_ATOMIC_CAS_U64(p, expected, desired) \
@@ -38,23 +113,9 @@
 #define EF_ATOMIC_THREAD_FENCE() ((void)0)
 #endif
 
-/* struct ef_slot is packed; avoid __atomic_* on &slot->next_offset (Clang -Watomic-alignment). */
-static uint64_t ef_slot_u64_load(const struct ef_slot *slot, size_t member_offset)
-{
-    const unsigned char *base;
-    uint64_t value;
-
-    base = (const unsigned char *)slot + member_offset;
-    memcpy(&value, base, sizeof(value));
-#if defined(__GNUC__) || defined(__clang__)
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-#endif
-    return value;
-}
-
 static uint64_t ef_slot_next_offset_load(const struct ef_slot *slot)
 {
-    return ef_slot_u64_load(slot, offsetof(struct ef_slot, next_offset));
+    return ef_atomic_load_u64((const unsigned char *)slot + offsetof(struct ef_slot, next_offset));
 }
 
 #define EF_QUEUE_SPIN_MAX 65536U
