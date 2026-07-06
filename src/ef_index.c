@@ -17,6 +17,30 @@
 
 #define EF_SB_SIZE 64U
 
+static int ef_hash_entry_empty_atomic(const struct ef_hash_entry *entry)
+{
+    return ef_atomic_load_u64((const void *)&entry->slot_offset) == 0ULL;
+}
+
+static void ef_hash_entry_load_atomic(const struct ef_hash_entry *entry, struct ef_hash_entry *out)
+{
+    out->slot_offset = ef_atomic_load_u64((const void *)&entry->slot_offset);
+    out->key_hash = ef_atomic_load_u64((const void *)&entry->key_hash);
+}
+
+static void ef_hash_entry_store_atomic(struct ef_hash_entry *entry, uint64_t key_hash,
+                                       uint64_t slot_offset)
+{
+    ef_atomic_store_u64(&entry->key_hash, key_hash);
+    ef_atomic_store_u64(&entry->slot_offset, slot_offset);
+}
+
+static void ef_hash_entry_clear_atomic(struct ef_hash_entry *entry)
+{
+    ef_atomic_store_u64(&entry->key_hash, 0ULL);
+    ef_atomic_store_u64(&entry->slot_offset, 0ULL);
+}
+
 static uint64_t *ef_idx_queue_head_ptr(struct ef_superblock *sb)
 {
     return (uint64_t *)&sb->reserved[EF_SB_OFF_QUEUE_HEAD];
@@ -153,7 +177,7 @@ static void ef_index_write_end(struct ef_db *db)
 
 static int ef_hash_entry_empty(const struct ef_hash_entry *entry)
 {
-    return entry->slot_offset == 0;
+    return ef_hash_entry_empty_atomic(entry);
 }
 
 static uint32_t ef_hash_home(uint32_t capacity, uint64_t key_hash)
@@ -206,22 +230,25 @@ static enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint6
 
     for (i = home; i < home + capacity; ++i) {
         struct ef_hash_entry *entry = db->hash_index + (i % capacity);
+        struct ef_hash_entry cur;
 
-        if (ef_hash_entry_empty(entry)) {
-            *entry = incoming;
+        ef_hash_entry_load_atomic(entry, &cur);
+
+        if (ef_hash_entry_empty_atomic(entry)) {
+            ef_hash_entry_store_atomic(entry, incoming.key_hash, incoming.slot_offset);
             return EF_OK;
         }
 
-        if (entry->key_hash == key_hash) {
-            entry->slot_offset = slot_offset;
+        if (cur.key_hash == key_hash) {
+            ef_hash_entry_store_atomic(entry, key_hash, slot_offset);
             return EF_OK;
         }
 
         if (ef_hash_probe_dist(capacity, home, i % capacity) >
-            ef_hash_probe_dist(capacity, ef_hash_home(capacity, entry->key_hash),
+            ef_hash_probe_dist(capacity, ef_hash_home(capacity, cur.key_hash),
                                (uint32_t)(entry - db->hash_index))) {
-            outgoing = *entry;
-            *entry = incoming;
+            outgoing = cur;
+            ef_hash_entry_store_atomic(entry, incoming.key_hash, incoming.slot_offset);
             incoming = outgoing;
             home = ef_hash_home(capacity, incoming.key_hash);
         }
@@ -246,12 +273,15 @@ static enum ef_err ef_index_find_entry_unlocked(const struct ef_db *db, uint64_t
 
     for (i = home; i < home + capacity; ++i) {
         const struct ef_hash_entry *entry = db->hash_index + (i % capacity);
+        struct ef_hash_entry cur;
 
-        if (ef_hash_entry_empty(entry)) {
+        ef_hash_entry_load_atomic(entry, &cur);
+
+        if (ef_hash_entry_empty_atomic(entry)) {
             return EF_ERR_NOT_FOUND;
         }
-        if (entry->key_hash == key_hash) {
-            *out = *entry;
+        if (cur.key_hash == key_hash) {
+            *out = cur;
             return EF_OK;
         }
     }
@@ -374,28 +404,34 @@ static enum ef_err ef_index_remove_by_hash(struct ef_db *db, uint64_t key_hash)
 
     for (i = home; i < home + capacity; ++i) {
         struct ef_hash_entry *entry = db->hash_index + (i % capacity);
+        struct ef_hash_entry cur;
 
-        if (ef_hash_entry_empty(entry)) {
+        ef_hash_entry_load_atomic(entry, &cur);
+
+        if (ef_hash_entry_empty_atomic(entry)) {
             return EF_ERR_NOT_FOUND;
         }
-        if (entry->key_hash == key_hash) {
+        if (cur.key_hash == key_hash) {
             pos = i % capacity;
             for (;;) {
                 uint32_t next_pos = (pos + 1U) % capacity;
                 struct ef_hash_entry *next = db->hash_index + next_pos;
+                struct ef_hash_entry next_val;
 
-                if (ef_hash_entry_empty(next)) {
-                    memset(entry, 0, sizeof(*entry));
+                ef_hash_entry_load_atomic(next, &next_val);
+
+                if (ef_hash_entry_empty_atomic(next)) {
+                    ef_hash_entry_clear_atomic(entry);
                     return EF_OK;
                 }
 
-                if (ef_hash_probe_dist(capacity, ef_hash_home(capacity, next->key_hash),
+                if (ef_hash_probe_dist(capacity, ef_hash_home(capacity, next_val.key_hash),
                                        next_pos) == 0) {
-                    memset(entry, 0, sizeof(*entry));
+                    ef_hash_entry_clear_atomic(entry);
                     return EF_OK;
                 }
 
-                *entry = *next;
+                ef_hash_entry_store_atomic(entry, next_val.key_hash, next_val.slot_offset);
                 entry = next;
                 pos = next_pos;
             }
@@ -457,8 +493,11 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
     }
 
     for (i = 0; i < db->hash_capacity; ++i) {
-        if (db->hash_index[i].slot_offset == slot_offset) {
-            err = ef_index_remove_by_hash(db, db->hash_index[i].key_hash);
+        struct ef_hash_entry cur;
+
+        ef_hash_entry_load_atomic(&db->hash_index[i], &cur);
+        if (cur.slot_offset == slot_offset) {
+            err = ef_index_remove_by_hash(db, cur.key_hash);
             if (err == EF_ERR_NOT_FOUND) {
                 err = EF_OK;
             }

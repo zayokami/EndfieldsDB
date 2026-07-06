@@ -69,8 +69,40 @@ static void ef_queue_yield(uint32_t spins)
 static void ef_set_error(struct ef_db *db, enum ef_err err)
 {
     if (db != NULL) {
-        db->last_err = err;
+        atomic_store_explicit(&db->last_err, (uint32_t)err, memory_order_relaxed);
     }
+}
+
+static uint32_t ef_sb_free_count_load(const struct ef_superblock *sb)
+{
+    if (sb == NULL) {
+        return 0;
+    }
+    return ef_atomic_load_u32((const void *)&sb->free_count);
+}
+
+static void ef_sb_free_count_store(struct ef_superblock *sb, uint32_t value)
+{
+    if (sb == NULL) {
+        return;
+    }
+    ef_atomic_store_u32((void *)&sb->free_count, value);
+}
+
+static void ef_sb_free_count_inc(struct ef_superblock *sb)
+{
+    if (sb == NULL) {
+        return;
+    }
+    (void)ef_atomic_fetch_add_u32((void *)&sb->free_count, 1U);
+}
+
+static void ef_sb_free_count_dec(struct ef_superblock *sb)
+{
+    if (sb == NULL) {
+        return;
+    }
+    (void)ef_atomic_fetch_sub_u32((void *)&sb->free_count, 1U);
 }
 
 static uint32_t *ef_sb_checksum_ptr(struct ef_superblock *sb)
@@ -110,7 +142,7 @@ void ef_db_mark_meta_dirty(struct ef_db *db)
         return;
     }
     if (db->sb->flags & EF_FLAG_SB_CRC) {
-        db->sb_meta_dirty = 1;
+        atomic_store_explicit(&db->sb_meta_dirty, (uint8_t)1, memory_order_relaxed);
     }
 }
 
@@ -123,9 +155,9 @@ enum ef_err ef_db_commit_meta(struct ef_db *db)
         ef_set_error(db, EF_OK);
         return EF_OK;
     }
-    if (db->sb_meta_dirty) {
+    if (atomic_load_explicit(&db->sb_meta_dirty, memory_order_relaxed)) {
         ef_sb_checksum_store(db->sb);
-        db->sb_meta_dirty = 0;
+        atomic_store_explicit(&db->sb_meta_dirty, (uint8_t)0, memory_order_relaxed);
     }
     ef_set_error(db, EF_OK);
     return EF_OK;
@@ -201,7 +233,7 @@ static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_o
         ef_queue_yield(spins);
 
         head = EF_ATOMIC_LOAD_U64(head_ptr);
-        if (head == 0 || db->sb->free_count == 0) {
+        if (head == 0 || ef_sb_free_count_load(db->sb) == 0) {
             ef_set_error(db, EF_ERR_SLOT_FULL);
             return EF_ERR_SLOT_FULL;
         }
@@ -223,9 +255,7 @@ static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_o
             ef_slot_next_offset_store(slot, 0);
             slot->status = EF_STATUS_USED;
             memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
-            if (db->sb->free_count > 0) {
-                --db->sb->free_count;
-            }
+            ef_sb_free_count_dec(db->sb);
             ef_slot_header_crc_store(db, slot_id, slot);
             ef_db_mark_meta_dirty(db);
             *slot_id_out = slot_id;
@@ -261,7 +291,7 @@ static enum ef_err ef_free_list_push_atomic(struct ef_db *db, uint64_t slot_id, 
         exp = head;
         if (EF_ATOMIC_CAS_U64(head_ptr, &exp, slot_offset)) {
             slot->status = EF_STATUS_FREE;
-            ++db->sb->free_count;
+            ef_sb_free_count_inc(db->sb);
             ef_db_mark_meta_dirty(db);
             ef_set_error(db, EF_OK);
             return EF_OK;
@@ -503,7 +533,7 @@ static void ef_init_superblock(struct ef_superblock *sb, uint64_t max_slots, uin
     sb->free_list_head = 0;
     sb->schema_version = EF_SCHEMA_VERSION;
     sb->flags = EF_FLAG_SB_CRC | EF_FLAG_SLOT_CRC;
-    sb->free_count = (uint32_t)max_slots;
+    ef_sb_free_count_store(sb, (uint32_t)max_slots);
     memset(sb->reserved, 0, sizeof(sb->reserved));
     ef_sb_hash_capacity_store(sb, hash_capacity);
     ef_sb_checksum_store(sb);
@@ -524,7 +554,7 @@ static void ef_upgrade_superblock(struct ef_superblock *sb, uint64_t free_count)
         sb->schema_version = EF_SCHEMA_LEGACY;
         sb->flags = EF_FLAG_NONE;
     }
-    sb->free_count = (uint32_t)free_count;
+    ef_sb_free_count_store(sb, (uint32_t)free_count);
     ef_sb_checksum_store(sb);
 }
 
@@ -557,7 +587,7 @@ static enum ef_err ef_build_free_list(struct ef_db *db)
     db->sb->free_list_head = 0;
 
     if (max_slots == 0) {
-        db->sb->free_count = 0;
+        ef_sb_free_count_store(db->sb, 0);
         return EF_OK;
     }
 
@@ -569,7 +599,7 @@ static enum ef_err ef_build_free_list(struct ef_db *db)
     }
 
     db->sb->free_list_head = ef_slot_to_offset(db, 0);
-    db->sb->free_count = (uint32_t)max_slots;
+    ef_sb_free_count_store(db->sb, (uint32_t)max_slots);
     ef_db_refresh_checksums(db);
     return EF_OK;
 }
@@ -681,8 +711,8 @@ static enum ef_err ef_claim_slot(struct ef_db *db, uint64_t slot_id)
     }
 
     slot->status = EF_STATUS_USED;
-    if (db->sb->free_count > 0) {
-        --db->sb->free_count;
+    if (ef_sb_free_count_load(db->sb) > 0) {
+        ef_sb_free_count_dec(db->sb);
     }
     ef_slot_header_crc_store(db, slot_id, slot);
     ef_db_mark_meta_dirty(db);
@@ -728,7 +758,7 @@ enum ef_err ef_last_error(const struct ef_db *db)
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    return db->last_err;
+    return (enum ef_err)atomic_load_explicit(&db->last_err, memory_order_relaxed);
 }
 
 #if EF_HAS_FILE_IO
@@ -771,7 +801,7 @@ enum ef_err ef_open_ex_hash(const char *filepath, uint64_t initial_slots, uint32
         return err;
     }
 
-    db->last_err = EF_OK;
+    ef_set_error(db, EF_OK);
     *db_out = db;
     return EF_OK;
 }
@@ -821,7 +851,7 @@ enum ef_err ef_open_readonly_ex(const char *filepath, struct ef_db **db_out)
     }
 
     db->readonly = 1;
-    db->last_err = EF_OK;
+    ef_set_error(db, EF_OK);
     *db_out = db;
     return EF_OK;
 }
@@ -943,7 +973,7 @@ enum ef_err ef_open_memory_hash(void *buffer, size_t buffer_size, uint64_t max_s
         return err;
     }
 
-    db->last_err = EF_OK;
+    ef_set_error(db, EF_OK);
     *db_out = db;
     return EF_OK;
 }
@@ -1116,7 +1146,7 @@ static enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, st
     slot->status = EF_STATUS_FREE;
     slot->header_crc = 0;
     memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
-    ++db->sb->free_count;
+    ef_sb_free_count_inc(db->sb);
     ef_db_mark_meta_dirty(db);
     ef_set_error(db, EF_OK);
     return EF_OK;
@@ -1593,7 +1623,7 @@ static enum ef_err ef_grow_append_slots(struct ef_db *db, uint64_t old_max, uint
         slot->status = EF_STATUS_FREE;
         slot->next_offset = db->sb->free_list_head;
         db->sb->free_list_head = ef_slot_to_offset(db, i);
-        ++db->sb->free_count;
+        ef_sb_free_count_inc(db->sb);
     }
 
     ef_db_mark_meta_dirty(db);
@@ -2098,7 +2128,7 @@ enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out)
     struct ef_slot *slot;
     uint64_t slot_id;
 
-    if (db->sb->free_list_head == 0 || db->sb->free_count == 0) {
+    if (db->sb->free_list_head == 0 || ef_sb_free_count_load(db->sb) == 0) {
         ef_set_error(db, EF_ERR_SLOT_FULL);
         return EF_ERR_SLOT_FULL;
     }
@@ -2118,7 +2148,7 @@ enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out)
     slot->next_offset = 0;
     slot->status = EF_STATUS_USED;
     memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
-    --db->sb->free_count;
+    ef_sb_free_count_dec(db->sb);
     ef_slot_header_crc_store(db, slot_id, slot);
     ef_db_mark_meta_dirty(db);
 
@@ -2184,7 +2214,7 @@ uint64_t ef_count_free_slots(const struct ef_db *db)
     if (db == NULL || db->sb == NULL) {
         return 0;
     }
-    return db->sb->free_count;
+    return ef_sb_free_count_load(db->sb);
 }
 
 enum ef_err ef_alloc(struct ef_db *db, uint64_t *slot_id_out)

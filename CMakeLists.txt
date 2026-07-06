@@ -23,6 +23,7 @@ if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
 endif()
 
 if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options(/W4 /utf-8)
     if(ENDFIELDS_WARNINGS_AS_ERRORS)
         add_compile_options(/WX)

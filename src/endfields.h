@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 #include "ef_config.h"
 
@@ -120,13 +121,13 @@ struct ef_db {
     size_t map_capacity;
     struct ef_superblock *sb;
     struct ef_slot *slots;
-    enum ef_err last_err;
+    _Atomic uint32_t last_err;
     enum ef_backend backend;
     uint64_t slots_base;
     uint32_t hash_capacity;
     struct ef_hash_entry *hash_index;
     int readonly;
-    uint8_t sb_meta_dirty;
+    _Atomic uint8_t sb_meta_dirty;
 #ifdef _WIN32
     void *map_handle;
 #endif

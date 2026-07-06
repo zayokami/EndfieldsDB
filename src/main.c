@@ -1424,9 +1424,36 @@ static void mpmc_atomic_inc(volatile long *value)
 #endif
 }
 
+static long mpmc_atomic_load(const volatile long *value)
+{
+#if defined(_WIN32)
+    return InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+#else
+    return *value;
+#endif
+}
+
+static void mpmc_stop_signal(volatile long *stop)
+{
+#if defined(_WIN32)
+    InterlockedExchange((volatile LONG *)stop, 1L);
+#elif defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(stop, 1L, __ATOMIC_RELEASE);
+#else
+    *stop = 1L;
+#endif
+}
+
+static int mpmc_stop_requested(const volatile long *stop)
+{
+    return mpmc_atomic_load(stop) != 0L;
+}
+
 static int mpmc_producers_finished(const volatile long *done, int producer_count)
 {
-    return *done >= producer_count;
+    return mpmc_atomic_load(done) >= producer_count;
 }
 
 static int mpmc_consumer_should_exit(struct ef_db *db, const volatile long *done, int producer_count)
@@ -1596,7 +1623,7 @@ static unsigned __stdcall ef_index_mrsr_reader_win(void *arg)
         uint64_t slot_id = 0;
         enum ef_err err;
 
-        if (*ctx->stop) {
+        if (mpmc_stop_requested(ctx->stop)) {
             break;
         }
 
@@ -1608,10 +1635,6 @@ static unsigned __stdcall ef_index_mrsr_reader_win(void *arg)
             continue;
         }
         if (err != EF_OK) {
-            mpmc_atomic_inc(ctx->errors);
-            break;
-        }
-        if (ef_get_slot(ctx->db, slot_id) == NULL) {
             mpmc_atomic_inc(ctx->errors);
             break;
         }
@@ -1631,7 +1654,7 @@ static unsigned __stdcall ef_index_mrsr_writer_win(void *arg)
         enum ef_err err;
         int attempt;
 
-        if (*ctx->stop) {
+        if (mpmc_stop_requested(ctx->stop)) {
             break;
         }
 
@@ -1685,7 +1708,7 @@ static unsigned __stdcall ef_index_mrsr_writer_win(void *arg)
         }
     }
 
-    *ctx->stop = 1;
+    mpmc_stop_signal(ctx->stop);
     return 0;
 }
 #else
@@ -1700,7 +1723,7 @@ static void *ef_index_mrsr_reader_pthread(void *arg)
         uint64_t slot_id = 0;
         enum ef_err err;
 
-        if (*ctx->stop) {
+        if (mpmc_stop_requested(ctx->stop)) {
             break;
         }
 
@@ -1712,10 +1735,6 @@ static void *ef_index_mrsr_reader_pthread(void *arg)
             continue;
         }
         if (err != EF_OK) {
-            mpmc_atomic_inc(ctx->errors);
-            break;
-        }
-        if (ef_get_slot(ctx->db, slot_id) == NULL) {
             mpmc_atomic_inc(ctx->errors);
             break;
         }
@@ -1735,7 +1754,7 @@ static void *ef_index_mrsr_writer_pthread(void *arg)
         enum ef_err err;
         int attempt;
 
-        if (*ctx->stop) {
+        if (mpmc_stop_requested(ctx->stop)) {
             break;
         }
 
@@ -1789,7 +1808,7 @@ static void *ef_index_mrsr_writer_pthread(void *arg)
         }
     }
 
-    *ctx->stop = 1;
+    mpmc_stop_signal(ctx->stop);
     return NULL;
 }
 #endif

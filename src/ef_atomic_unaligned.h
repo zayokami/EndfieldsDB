@@ -318,4 +318,36 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
 }
 #endif
 
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+static inline uint32_t ef_atomic_fetch_add_u32(volatile void *ptr, uint32_t delta)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
+#if defined(__GNUC__) || defined(__clang__)
+        return (uint32_t)__atomic_fetch_add((volatile uint32_t *)ptr, delta, __ATOMIC_RELAXED);
+#else
+        return (uint32_t)_InterlockedExchangeAdd((volatile long *)ptr, (long)delta);
+#endif
+    }
+
+    {
+        uint32_t prev;
+
+        for (;;) {
+            uint32_t next;
+
+            memcpy(&prev, (const void *)ptr, sizeof(prev));
+            next = prev + delta;
+            if (ef_atomic_cas_u32(ptr, &prev, next)) {
+                return prev;
+            }
+        }
+    }
+}
+
+static inline uint32_t ef_atomic_fetch_sub_u32(volatile void *ptr, uint32_t delta)
+{
+    return ef_atomic_fetch_add_u32(ptr, (uint32_t)(0U - delta));
+}
+#endif
+
 #endif /* EF_ATOMIC_UNALIGNED_H */
