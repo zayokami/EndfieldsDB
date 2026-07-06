@@ -573,6 +573,8 @@ static void test_slot_header_crc_memory(void)
         slot->header_crc ^= 0xA5A5A5A5U;
         expect_true(ef_get_slot(db, id_tamper) == NULL, "reject tampered header_crc");
         expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "tampered header_crc error");
+        slot->header_crc ^= 0xA5A5A5A5U;
+        expect_true(ef_get_slot(db, id_tamper) != NULL, "restore tampered header_crc");
     }
 
     err = ef_alloc_slot(db, &id_zero);
@@ -640,6 +642,15 @@ static void test_slot_header_crc_memory(void)
         expect_err(err, EF_OK, "slot crc free probe");
         expect_true(ef_get_slot(db, id_free) != NULL, "free slot skips crc verify");
         expect_true(db->slots[id_free].status == EF_STATUS_FREE, "free slot status readable");
+
+        slot = ef_peek_slot(db, id_tamper);
+        expect_true(slot != NULL, "peek_slot returns pointer without crc");
+        expect_true(slot == ef_get_slot(db, id_tamper), "peek matches get when crc ok");
+        slot->header_crc ^= 0x22222222U;
+        expect_true(ef_peek_slot(db, id_tamper) != NULL, "peek ignores tampered crc");
+        expect_true(ef_get_slot(db, id_tamper) == NULL, "get_slot still rejects tampered crc");
+        slot->header_crc ^= 0x22222222U;
+        expect_true(ef_get_slot(db, id_tamper) != NULL, "peek tamper restored");
 
         db->slots[id_tamper].header_crc ^= 0x11111111U;
         visit_count = 0;
@@ -2542,7 +2553,7 @@ static void run_perf_suite(struct ef_db *db)
 
     bench_prepare_chain(db, 32);
 
-    chase_cur = ef_get_slot(db, 0);
+    chase_cur = ef_peek_slot(db, 0);
     for (r = 0; r < BENCH_ROUNDS; ++r) {
         t0 = now_seconds();
         for (i = 0; i < fast_iters; ++i) {
@@ -2575,6 +2586,16 @@ static void run_perf_suite(struct ef_db *db)
         samples[r] = (t1 - t0) / (double)verify_iters * 1e9;
     }
     bench_print_stats("ef_get_slot + CRC verify", verify_iters, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        t0 = now_seconds();
+        for (i = 0; i < verify_iters; ++i) {
+            sink ^= (uintptr_t)ef_peek_slot(db, (uint64_t)(i % 32));
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) / (double)verify_iters * 1e9;
+    }
+    bench_print_stats("ef_peek_slot (no CRC)", verify_iters, BENCH_ROUNDS, samples);
 
     for (r = 0; r < BENCH_ROUNDS; ++r) {
         bench_touch_cold_cache();

@@ -168,6 +168,8 @@ size_t ef_payload_capacity(const struct ef_db *db);
 void *ef_slot_payload_ptr(const struct ef_db *db, struct ef_slot *slot);
 
 struct ef_slot *ef_get_slot(struct ef_db *db, uint64_t slot_id);
+/* Bounds-checked slot pointer without header CRC (hot read / invariants already held). */
+struct ef_slot *ef_peek_slot(struct ef_db *db, uint64_t slot_id);
 void *ef_offset_to_ptr(struct ef_db *db, uint64_t offset);
 struct ef_slot *ef_chase(struct ef_db *db, struct ef_slot *current_slot);
 struct ef_slot *ef_chase_n(struct ef_db *db, uint64_t start_offset, uint32_t hops, uint32_t *hops_done_out);

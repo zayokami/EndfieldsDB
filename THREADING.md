@@ -103,6 +103,15 @@ for (;;) {
 - `ef_write_payload` / `ef_write_blob` / `ef_set_*` / `ef_chase*`
 - `ef_foreach_used` / `ef_slot_iter`
 
+### `ef_get_slot` vs `ef_peek_slot`
+
+| API | CRC 校验 | 适用场景 |
+|-----|----------|----------|
+| `ef_get_slot` | 是（`EF_STATUS_USED` 等） | 持久化读、重开文件、不信任 mmap 时 |
+| `ef_peek_slot` | 否（仅边界检查） | 追逐热路径、已持队列锁、刚写完的槽 |
+
+队列内部节点（`QUEUED` / `QUEUE_DUMMY` 等）的槽头 CRC 仅覆盖 **status + next_offset**（link CRC），不哈希 payload，以降低入队/出队开销；`ef_get_slot` 仍接受旧版全字段 CRC（向后兼容）。
+
 索引 MRSW **不**保护槽内 payload。典型模式：
 
 1. 写者：`ef_index_put` 后单线程写槽（或外部槽锁）。
