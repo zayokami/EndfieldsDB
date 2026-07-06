@@ -10,7 +10,12 @@ static inline int ef_atomic_ptr_is_aligned(const volatile void *ptr, size_t alig
 }
 
 #if defined(__GNUC__) || defined(__clang__)
-#define EF_ATOMIC_THREAD_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__SANITIZE_THREAD__)
+#define ef_atomic_thread_fence(order) __atomic_signal_fence(order)
+#else
+#define ef_atomic_thread_fence(order) __atomic_thread_fence(order)
+#endif
+#define EF_ATOMIC_THREAD_FENCE() ef_atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 static inline uint64_t ef_atomic_load_u64(const volatile void *ptr)
 {
@@ -22,7 +27,7 @@ static inline uint64_t ef_atomic_load_u64(const volatile void *ptr)
         uint64_t value;
 
         memcpy(&value, (const void *)ptr, sizeof(value));
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        ef_atomic_thread_fence(__ATOMIC_ACQUIRE);
         return value;
     }
 }
@@ -34,7 +39,7 @@ static inline void ef_atomic_store_u64(volatile void *ptr, uint64_t value)
         return;
     }
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ef_atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy((void *)ptr, (const void *)&value, sizeof(value));
 }
 
@@ -61,7 +66,7 @@ static inline int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint
                 return 0;
             }
             memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
-            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            ef_atomic_thread_fence(__ATOMIC_SEQ_CST);
             memcpy(&cur, (const void *)ptr, sizeof(cur));
             if (cur == desired) {
                 return 1;
@@ -78,7 +83,7 @@ static inline void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
         return;
     }
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ef_atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy((void *)ptr, (const void *)&value, sizeof(value));
 }
 
@@ -92,7 +97,7 @@ static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
         uint32_t value;
 
         memcpy(&value, (const void *)ptr, sizeof(value));
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        ef_atomic_thread_fence(__ATOMIC_ACQUIRE);
         return value;
     }
 }
@@ -120,7 +125,7 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
                 return 0;
             }
             memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
-            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            ef_atomic_thread_fence(__ATOMIC_SEQ_CST);
             memcpy(&cur, (const void *)ptr, sizeof(cur));
             if (cur == desired) {
                 return 1;
@@ -130,6 +135,10 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
     }
 }
 #elif defined(_MSC_VER)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <intrin.h>
 
 #define EF_ATOMIC_THREAD_FENCE() MemoryBarrier()
@@ -167,9 +176,9 @@ static inline void ef_atomic_store_u64(volatile void *ptr, uint64_t value)
 static inline int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t desired)
 {
     if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint64_t))) {
-        volatile LONG64 *word = (volatile LONG64 *)ptr;
-        LONG64 exp = (LONG64)*expected;
-        LONG64 prev = _InterlockedCompareExchange64(word, (LONG64)desired, exp);
+        volatile __int64 *word = (volatile __int64 *)ptr;
+        __int64 exp = (__int64)*expected;
+        __int64 prev = _InterlockedCompareExchange64(word, (__int64)desired, exp);
 
         if (prev == exp) {
             return 1;
@@ -231,9 +240,9 @@ static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
 static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
 {
     if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
-        volatile LONG *word = (volatile LONG *)ptr;
-        LONG exp = (LONG)*expected;
-        LONG prev = _InterlockedCompareExchange(word, (LONG)desired, exp);
+        volatile long *word = (volatile long *)ptr;
+        long exp = (long)*expected;
+        long prev = _InterlockedCompareExchange(word, (long)desired, exp);
 
         if (prev == exp) {
             return 1;

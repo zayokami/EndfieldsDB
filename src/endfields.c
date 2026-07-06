@@ -38,7 +38,7 @@ static void ef_slot_next_offset_store(struct ef_slot *slot, uint64_t value)
 
 #define EF_QUEUE_SPIN_MAX 65536U
 
-#if defined(__GNUC__) || defined(__clang__)
+#if EF_HAS_HW_ATOMICS
 static void ef_queue_yield(uint32_t spins)
 {
     if (spins < 64U) {
@@ -181,7 +181,7 @@ static void ef_slot_header_crc_store(struct ef_db *db, uint64_t slot_id, struct 
     slot->header_crc = ef_slot_header_crc_compute(slot_id, slot);
 }
 
-#if defined(__GNUC__) || defined(__clang__)
+#if EF_HAS_HW_ATOMICS
 static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_out)
 {
     volatile uint64_t *head_ptr = (volatile uint64_t *)&db->sb->free_list_head;
@@ -503,7 +503,7 @@ static void ef_init_superblock(struct ef_superblock *sb, uint64_t max_slots, uin
     sb->free_list_head = 0;
     sb->schema_version = EF_SCHEMA_VERSION;
     sb->flags = EF_FLAG_SB_CRC | EF_FLAG_SLOT_CRC;
-    sb->free_count = max_slots;
+    sb->free_count = (uint32_t)max_slots;
     memset(sb->reserved, 0, sizeof(sb->reserved));
     ef_sb_hash_capacity_store(sb, hash_capacity);
     ef_sb_checksum_store(sb);
@@ -524,7 +524,7 @@ static void ef_upgrade_superblock(struct ef_superblock *sb, uint64_t free_count)
         sb->schema_version = EF_SCHEMA_LEGACY;
         sb->flags = EF_FLAG_NONE;
     }
-    sb->free_count = free_count;
+    sb->free_count = (uint32_t)free_count;
     ef_sb_checksum_store(sb);
 }
 
@@ -569,7 +569,7 @@ static enum ef_err ef_build_free_list(struct ef_db *db)
     }
 
     db->sb->free_list_head = ef_slot_to_offset(db, 0);
-    db->sb->free_count = max_slots;
+    db->sb->free_count = (uint32_t)max_slots;
     ef_db_refresh_checksums(db);
     return EF_OK;
 }
@@ -1107,10 +1107,10 @@ static enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, st
         return err;
     }
 
-#if defined(__GNUC__) || defined(__clang__)
+#if EF_HAS_HW_ATOMICS
     return ef_free_list_push_atomic(db, slot_id, slot);
 #else
-    slot_offset = ef_slot_to_offset(db, slot_id);
+    uint64_t slot_offset = ef_slot_to_offset(db, slot_id);
     slot->next_offset = db->sb->free_list_head;
     db->sb->free_list_head = slot_offset;
     slot->status = EF_STATUS_FREE;
@@ -2092,7 +2092,7 @@ enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out)
         ef_set_error(db, EF_ERR_NULL_ARG);
         return EF_ERR_NULL_ARG;
     }
-#if defined(__GNUC__) || defined(__clang__)
+#if EF_HAS_HW_ATOMICS
     return ef_free_list_pop_atomic(db, slot_id_out);
 #else
     struct ef_slot *slot;

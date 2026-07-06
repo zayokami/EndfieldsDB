@@ -28,6 +28,13 @@
 #define EF_PREFETCH_R(addr) ((void)0)
 #endif
 
+/* GCC/Clang __atomic_* or MSVC Interlocked/MemoryBarrier. */
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+#define EF_HAS_HW_ATOMICS 1
+#else
+#define EF_HAS_HW_ATOMICS 0
+#endif
+
 /* Likely/unlikely branch hints. */
 #if defined(__GNUC__) || defined(__clang__)
 #define EF_LIKELY(x)   __builtin_expect(!!(x), 1)
