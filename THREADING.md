@@ -93,8 +93,9 @@ for (;;) {
 ## 空闲链与 `ef_alloc`
 
 - `ef_alloc_slot`：CAS 从 LIFO 空闲链弹出；失败返回 `EF_ERR_SLOT_FULL` 或 `EF_ERR_QUEUE_BUSY`（CAS 重试耗尽）。
-- `ef_alloc`：池空时 `ef_grow(+1)` 后重试。
+- `ef_alloc`：池空时 `ef_grow(+1)` 后重试。`ef_alloc_ex(..., 0)` 跳过 payload 清零，供 `ef_queue_push` 热路径使用。
 - `ef_free_slot`：归还空闲链并 `ef_index_remove_by_slot`（索引写锁）；**不可**用于仍在队列中的 `EF_STATUS_QUEUED` 槽。
+- `ef_db_mark_meta_dirty`：已脏时不再重复原子写；`ef_db_commit_meta` / `ef_sync` 刷新超级块 CRC（slicing-by-4 加速）。
 
 ## 槽位数据（仍须外部同步）
 

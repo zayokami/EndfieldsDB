@@ -180,6 +180,8 @@ enum ef_err ef_set_next_offset(struct ef_db *db, uint64_t slot_id, uint64_t next
 enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *data, uint8_t len);
 enum ef_err ef_write_field(struct ef_db *db, uint64_t slot_id, uint8_t field_offset, uint8_t value);
 
+#define EF_ALLOC_ZERO_PAYLOAD 1U
+
 enum ef_err ef_alloc_slot(struct ef_db *db, uint64_t *slot_id_out);
 struct ef_slot *ef_alloc_slot_ptr(struct ef_db *db, uint64_t *slot_id_out);
 enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id);
@@ -205,6 +207,7 @@ enum ef_err ef_read_blob(struct ef_db *db, uint64_t slot_id, void *buf, size_t b
 
 /* Persistent LIFO free-list allocator with tail grow (ef_alloc_slot / ef_free_slot). */
 enum ef_err ef_alloc(struct ef_db *db, uint64_t *slot_id_out);
+enum ef_err ef_alloc_ex(struct ef_db *db, uint64_t *slot_id_out, unsigned flags);
 
 /* Cross-process FIFO queue (dummy-head list, head/tail/lock in superblock reserved). */
 enum ef_err ef_queue_push(struct ef_db *db, const void *data, uint8_t len);
