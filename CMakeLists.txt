@@ -11,6 +11,7 @@ option(ENDFIELDS_ENABLE_PREFETCH "Enable CPU prefetch hints on chase path" ON)
 option(ENDFIELDS_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(ENDFIELDS_SANITIZE "Enable AddressSanitizer+UBSan (GCC/Clang)" OFF)
 option(ENDFIELDS_TSAN "Enable ThreadSanitizer (GCC/Clang)" OFF)
+option(ENDFIELDS_COVERAGE "Enable gcov/lcov code coverage (GCC/Clang)" OFF)
 option(ENDFIELDS_CI_FAST "Shorter performance bench loops for CI" OFF)
 
 if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -40,6 +41,18 @@ endif()
 
 if(ENDFIELDS_SANITIZE AND ENDFIELDS_TSAN)
     message(FATAL_ERROR "ENDFIELDS_SANITIZE and ENDFIELDS_TSAN are mutually exclusive")
+endif()
+
+if(ENDFIELDS_COVERAGE AND (ENDFIELDS_SANITIZE OR ENDFIELDS_TSAN))
+    message(FATAL_ERROR "ENDFIELDS_COVERAGE is incompatible with ENDFIELDS_SANITIZE and ENDFIELDS_TSAN")
+endif()
+
+if(ENDFIELDS_COVERAGE)
+    if(NOT (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+        message(FATAL_ERROR "ENDFIELDS_COVERAGE requires GCC or Clang")
+    endif()
+    add_compile_options(-O0 --coverage)
+    add_link_options(--coverage)
 endif()
 
 if(ENDFIELDS_SANITIZE)

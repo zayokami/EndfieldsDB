@@ -69,6 +69,63 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
 
+  coverage:
+    name: Linux GCC / coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc lcov
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DENDFIELDS_COVERAGE=ON
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+      - name: Capture coverage
+        run: |
+          set -euo pipefail
+          lcov --directory build --capture --output-file coverage.raw.info --rc branch_coverage=0
+          lcov --remove coverage.raw.info '/usr/*' '*/build/*' --output-file coverage.info
+          genhtml coverage.info --output-directory build/coverage-html --quiet
+          lcov --summary coverage.info
+
+      - name: Coverage summary
+        run: |
+          set -euo pipefail
+          summary="$(lcov --summary coverage.info 2>&1)"
+          echo "${summary}"
+          line_rate="$(echo "${summary}" | awk '/lines\.\.\.:/{print $2}')"
+          echo "line_coverage=${line_rate}" >> "${GITHUB_ENV}"
+          echo "### Code coverage" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          echo "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: build/coverage-html
+          if-no-files-found: error
+
+      - name: Upload lcov data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: coverage.info
+          if-no-files-found: error
+
   linux-clang:
     name: Linux Clang / Release
     runs-on: ubuntu-latest
@@ -253,6 +310,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - linux-gcc
+      - coverage
       - linux-clang
       - macos-clang
       - windows-msvc
@@ -265,6 +323,7 @@ jobs:
       - name: Require all jobs
         run: |
           test "${{ needs.linux-gcc.result }}" = "success"
+          test "${{ needs.coverage.result }}" = "success"
           test "${{ needs.linux-clang.result }}" = "success"
           test "${{ needs.macos-clang.result }}" = "success"
           test "${{ needs.windows-msvc.result }}" = "success"
