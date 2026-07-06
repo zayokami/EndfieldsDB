@@ -29,7 +29,7 @@ static void ef_sb_index_yield(uint32_t spins)
 #endif
 }
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
 static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 {
     uintptr_t addr = (uintptr_t)ptr;
@@ -215,7 +215,7 @@ enum ef_err ef_sb_queue_lock_acquire(struct ef_superblock *sb)
         volatile uint32_t *lock32 = (volatile uint32_t *)&sb->reserved[EF_SB_OFF_QUEUE_LOCK_V3];
         uint32_t exp32 = 0;
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
         for (;;) {
             if (++spins > EF_SB_INDEX_SPIN_MAX) {
                 return EF_ERR_QUEUE_BUSY;
@@ -236,7 +236,7 @@ enum ef_err ef_sb_queue_lock_acquire(struct ef_superblock *sb)
     }
 
     lock = ef_sb_queue_lock_byte(sb);
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
     for (;;) {
         if (++spins > EF_SB_INDEX_SPIN_MAX) {
             return EF_ERR_QUEUE_BUSY;
@@ -284,7 +284,7 @@ enum ef_err ef_sb_index_write_lock_acquire(struct ef_superblock *sb)
     }
 
     lock = ef_sb_index_write_lock_byte(sb);
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
     for (;;) {
         if (++spins > EF_SB_INDEX_SPIN_MAX) {
             return EF_ERR_INDEX_BUSY;

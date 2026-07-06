@@ -129,6 +129,138 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
         }
     }
 }
+#elif defined(_MSC_VER)
+#include <intrin.h>
+
+#define EF_ATOMIC_THREAD_FENCE() MemoryBarrier()
+
+static inline uint64_t ef_atomic_load_u64(const volatile void *ptr)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint64_t))) {
+        uint64_t value = *(const volatile uint64_t *)ptr;
+
+        MemoryBarrier();
+        return value;
+    }
+
+    {
+        uint64_t value;
+
+        memcpy(&value, (const void *)ptr, sizeof(value));
+        MemoryBarrier();
+        return value;
+    }
+}
+
+static inline void ef_atomic_store_u64(volatile void *ptr, uint64_t value)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint64_t))) {
+        *(volatile uint64_t *)ptr = value;
+        MemoryBarrier();
+        return;
+    }
+
+    MemoryBarrier();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static inline int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t desired)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint64_t))) {
+        volatile LONG64 *word = (volatile LONG64 *)ptr;
+        LONG64 exp = (LONG64)*expected;
+        LONG64 prev = _InterlockedCompareExchange64(word, (LONG64)desired, exp);
+
+        if (prev == exp) {
+            return 1;
+        }
+        *expected = (uint64_t)prev;
+        return 0;
+    }
+
+    {
+        uint64_t cur;
+
+        for (;;) {
+            memcpy(&cur, (const void *)ptr, sizeof(cur));
+            if (cur != *expected) {
+                *expected = cur;
+                return 0;
+            }
+            memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+            MemoryBarrier();
+            memcpy(&cur, (const void *)ptr, sizeof(cur));
+            if (cur == desired) {
+                return 1;
+            }
+            *expected = cur;
+        }
+    }
+}
+
+static inline void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
+        *(volatile uint32_t *)ptr = value;
+        MemoryBarrier();
+        return;
+    }
+
+    MemoryBarrier();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
+        uint32_t value = *(const volatile uint32_t *)ptr;
+
+        MemoryBarrier();
+        return value;
+    }
+
+    {
+        uint32_t value;
+
+        memcpy(&value, (const void *)ptr, sizeof(value));
+        MemoryBarrier();
+        return value;
+    }
+}
+
+static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
+        volatile LONG *word = (volatile LONG *)ptr;
+        LONG exp = (LONG)*expected;
+        LONG prev = _InterlockedCompareExchange(word, (LONG)desired, exp);
+
+        if (prev == exp) {
+            return 1;
+        }
+        *expected = (uint32_t)prev;
+        return 0;
+    }
+
+    {
+        uint32_t cur;
+
+        for (;;) {
+            memcpy(&cur, (const void *)ptr, sizeof(cur));
+            if (cur != *expected) {
+                *expected = cur;
+                return 0;
+            }
+            memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+            MemoryBarrier();
+            memcpy(&cur, (const void *)ptr, sizeof(cur));
+            if (cur == desired) {
+                return 1;
+            }
+            *expected = cur;
+        }
+    }
+}
 #else
 #define EF_ATOMIC_THREAD_FENCE() ((void)0)
 

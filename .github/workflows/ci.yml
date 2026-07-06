@@ -26,18 +26,27 @@ jobs:
           - id: release
             build_type: Release
             sanitize: OFF
+            tsan: OFF
             prefetch: ON
           - id: debug
             build_type: Debug
             sanitize: OFF
+            tsan: OFF
             prefetch: ON
           - id: no-prefetch
             build_type: Release
             sanitize: OFF
+            tsan: OFF
             prefetch: OFF
           - id: asan-ubsan
             build_type: Debug
             sanitize: ON
+            tsan: OFF
+            prefetch: ON
+          - id: tsan
+            build_type: RelWithDebInfo
+            sanitize: OFF
+            tsan: ON
             prefetch: ON
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +60,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DENDFIELDS_ENABLE_PREFETCH=${{ matrix.prefetch }}
           -DENDFIELDS_SANITIZE=${{ matrix.sanitize }}
+          -DENDFIELDS_TSAN=${{ matrix.tsan }}
           ${{ env.STRICT_CMAKE_FLAGS }}
 
       - name: Build
@@ -98,6 +108,24 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  windows-msvc:
+    name: Windows MSVC / Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 900 --no-tests=error
 
   windows-mingw:
     name: Windows MinGW / Release
@@ -161,6 +189,43 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
 
+  static-analysis:
+    name: Linux static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cmake clang clang-tidy cppcheck
+
+      - name: Generate compile_commands.json
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: clang-tidy
+        run: |
+          set -euo pipefail
+          mapfile -t sources < <(find src -name '*.c' | sort)
+          for source in "${sources[@]}"; do
+            echo "clang-tidy: ${source}"
+            clang-tidy "${source}" -p build --quiet
+          done
+
+      - name: cppcheck
+        run: >
+          cppcheck
+          --inline-suppr
+          --quiet
+          --error-exitcode=1
+          --enable=warning,performance,portability
+          -I src
+          --suppress=missingIncludeSystem
+          src/
+
   embedded:
     name: Linux embedded-only / Release
     runs-on: ubuntu-latest
@@ -190,8 +255,10 @@ jobs:
       - linux-gcc
       - linux-clang
       - macos-clang
+      - windows-msvc
       - windows-mingw
       - windows-mingw-debug
+      - static-analysis
       - embedded
     if: always()
     steps:
@@ -200,6 +267,8 @@ jobs:
           test "${{ needs.linux-gcc.result }}" = "success"
           test "${{ needs.linux-clang.result }}" = "success"
           test "${{ needs.macos-clang.result }}" = "success"
+          test "${{ needs.windows-msvc.result }}" = "success"
           test "${{ needs.windows-mingw.result }}" = "success"
           test "${{ needs.windows-mingw-debug.result }}" = "success"
+          test "${{ needs.static-analysis.result }}" = "success"
           test "${{ needs.embedded.result }}" = "success"
