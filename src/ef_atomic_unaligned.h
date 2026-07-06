@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-static inline int ef_atomic_ptr_is_aligned(const void *ptr, size_t alignment)
+static inline int ef_atomic_ptr_is_aligned(const volatile void *ptr, size_t alignment)
 {
     return ((uintptr_t)ptr & (uintptr_t)(alignment - 1U)) == 0U;
 }
