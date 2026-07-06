@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdalign.h>
+
+#include "ef_atomic_unaligned.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -258,7 +261,7 @@ static void test_chase_n(struct ef_db *db)
 
 static void test_memory_backend(void)
 {
-    static uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64];
     struct ef_db *db = NULL;
     uint64_t sid = 0;
     enum ef_err err;
@@ -283,7 +286,10 @@ static void test_memory_backend(void)
     err = ef_open_memory(buf, sizeof(buf), 16, 0, &db);
     expect_err(err, EF_OK, "memory reopen");
     if (db != NULL) {
-        expect_true(strcmp(ef_get_slot(db, sid)->payload, "ram") == 0, "memory data kept");
+        struct ef_slot *slot = ef_get_slot(db, sid);
+
+        expect_true(slot != NULL && strcmp((char *)ef_slot_payload_ptr(db, slot), "ram") == 0,
+                    "memory data kept");
         ef_close(db);
     }
 }
@@ -300,7 +306,7 @@ static int count_used_visit(struct ef_db *db, uint64_t slot_id, struct ef_slot *
 
 static void test_slot_iterator_memory(void)
 {
-    static uint8_t buf[64 + 32 * 64];
+    static alignas(64) uint8_t buf[64 + 32 * 64];
     struct ef_db *db = NULL;
     struct ef_slot_iter it;
     uint64_t id = 0;
@@ -343,7 +349,7 @@ static void test_slot_iterator_memory(void)
 
 static void test_blob_memory(void)
 {
-    static uint8_t buf[64 + 64 * 64];
+    static alignas(64) uint8_t buf[64 + 64 * 64];
     struct ef_db *db = NULL;
     uint64_t id = 0;
     uint8_t blob[120];
@@ -393,7 +399,7 @@ static void test_blob_memory(void)
 
 static void test_v1_upgrade_memory(void)
 {
-    static uint8_t buf[64 + 8 * 64];
+    static alignas(64) uint8_t buf[64 + 8 * 64];
     struct ef_superblock *sb;
     struct ef_slot *slots;
     struct ef_db *db = NULL;
@@ -457,7 +463,7 @@ static void test_v1_upgrade_memory(void)
 
 static void test_grow_memory(void)
 {
-    static uint8_t arena[64 + 16 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 64];
     struct ef_db *db = NULL;
     uint64_t seed_id = 0;
     uint64_t grown_id = 0;
@@ -536,7 +542,7 @@ static int crc_foreach_fail_on_bad(struct ef_db *db, uint64_t slot_id, struct ef
 
 static void test_slot_header_crc_memory(void)
 {
-    static uint8_t buf[64 + 32 * 64];
+    static alignas(64) uint8_t buf[64 + 32 * 64];
     struct ef_db *db = NULL;
     struct ef_slot *slot;
     struct ef_slot *ov;
@@ -1000,7 +1006,7 @@ static void test_superblock_checksum_reject(void)
 
 static void test_v1_upgrade_file(void)
 {
-    static uint8_t image[64 + 4 * 64];
+    static alignas(64) uint8_t image[64 + 4 * 64];
     struct ef_superblock *sb;
     struct ef_slot *slots;
     struct ef_db *db = NULL;
@@ -1217,7 +1223,7 @@ static void test_slot_header_crc_overflow_persist_file(void)
 
 static void test_v3_alloc_queue_index(void)
 {
-    static uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -1327,7 +1333,7 @@ static void test_v3_alloc_queue_index(void)
 
 static void test_index_lifecycle_and_rehash(void)
 {
-    static uint8_t arena[64 + 32 * 16 + 16 * 64];
+    static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -1412,7 +1418,14 @@ static void mpmc_atomic_inc(volatile long *value)
 #if defined(_WIN32)
     InterlockedIncrement(value);
 #else
-    (void)__atomic_fetch_add(value, 1, __ATOMIC_SEQ_CST);
+    uint64_t cur;
+
+    for (;;) {
+        memcpy(&cur, (const void *)value, sizeof(cur));
+        if (ef_atomic_cas_u64((volatile void *)value, &cur, (uint64_t)(cur + 1L))) {
+            return;
+        }
+    }
 #endif
 }
 
@@ -1992,7 +2005,7 @@ static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
 
 static void run_hash_perf_suite(volatile uintptr_t *sink)
 {
-    static uint8_t hash_arena[64 + 256 * 16 + 128 * 64];
+    static alignas(64) uint8_t hash_arena[64 + 256 * 16 + 128 * 64];
     struct ef_db *db = NULL;
     double samples[BENCH_MAX_ROUNDS];
     double t0;
@@ -2424,7 +2437,7 @@ static void run_engineering_scenarios(void)
 
 static void run_memory_engineering(void)
 {
-    static uint8_t arena[64 + 256 * 64];
+    static alignas(64) uint8_t arena[64 + 256 * 64];
     struct ef_db *db = NULL;
     enum ef_err err;
     double t0;

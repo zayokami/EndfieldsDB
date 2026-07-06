@@ -45,8 +45,6 @@
 #define EF_FLAG_SB_CRC    0x01U
 #define EF_FLAG_SLOT_CRC  0x02U
 
-#pragma pack(push, 1)
-
 struct ef_slot {
     uint32_t status;
     uint32_t header_crc;
@@ -65,17 +63,18 @@ struct ef_superblock {
     uint8_t reserved[28];
 };
 
+#pragma pack(push, 1)
 struct ef_cmd {
     uint8_t opcode;
     uint64_t param;
     uint8_t field_offset;
 };
-
 #pragma pack(pop)
 
 _Static_assert(sizeof(struct ef_slot) == 64, "struct ef_slot size must be 64 bytes");
 _Static_assert(sizeof(struct ef_superblock) == 64, "struct ef_superblock size must be 64 bytes");
 _Static_assert(sizeof(struct ef_cmd) == 10, "struct ef_cmd size must be 10 bytes");
+_Static_assert(offsetof(struct ef_slot, next_offset) == 56, "struct ef_slot next_offset offset");
 
 enum ef_err {
     EF_OK = 0,

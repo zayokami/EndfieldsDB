@@ -1,5 +1,6 @@
 #include "ef_index.h"
 #include "ef_port.h"
+#include "ef_atomic_unaligned.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -67,15 +68,24 @@ static void ef_index_fixup_all_offsets(struct ef_db *db, uint64_t old_base, uint
 
     db->sb->free_list_head =
         ef_index_fixup_offset(db->sb->free_list_head, old_base, new_base);
-    *ef_idx_queue_head_ptr(db->sb) =
-        ef_index_fixup_offset(*ef_idx_queue_head_ptr(db->sb), old_base, new_base);
-    *ef_idx_queue_tail_ptr(db->sb) =
-        ef_index_fixup_offset(*ef_idx_queue_tail_ptr(db->sb), old_base, new_base);
+    {
+        uint64_t queue_head = ef_atomic_load_u64((const void *)ef_idx_queue_head_ptr(db->sb));
+        uint64_t queue_tail = ef_atomic_load_u64((const void *)ef_idx_queue_tail_ptr(db->sb));
+
+        ef_atomic_store_u64(ef_idx_queue_head_ptr(db->sb),
+                            ef_index_fixup_offset(queue_head, old_base, new_base));
+        ef_atomic_store_u64(ef_idx_queue_tail_ptr(db->sb),
+                            ef_index_fixup_offset(queue_tail, old_base, new_base));
+    }
 
     for (i = 0; i < db->sb->max_slots; ++i) {
         struct ef_slot *slot = db->slots + i;
-        if (slot->next_offset >= old_base) {
-            slot->next_offset += (new_base - old_base);
+        uint64_t next_off = ef_atomic_load_u64((const unsigned char *)slot +
+                                               offsetof(struct ef_slot, next_offset));
+
+        if (next_off >= old_base) {
+            ef_atomic_store_u64((unsigned char *)slot + offsetof(struct ef_slot, next_offset),
+                                next_off + (new_base - old_base));
         }
     }
 }

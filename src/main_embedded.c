@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdalign.h>
 
 static int g_failures = 0;
 
@@ -24,7 +25,7 @@ static void expect_err(enum ef_err got, enum ef_err want, const char *msg)
 
 int main(void)
 {
-    static uint8_t arena[64 + 32 * 64];
+    static alignas(64) uint8_t arena[64 + 32 * 64];
     struct ef_db *db = NULL;
     struct ef_slot *end;
     uint64_t id0 = 0;
