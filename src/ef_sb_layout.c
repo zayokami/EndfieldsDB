@@ -30,16 +30,6 @@ static void ef_sb_index_yield(uint32_t spins)
 }
 
 #if defined(__GNUC__) || defined(__clang__)
-static uint8_t ef_atomic_load_u8(const volatile void *ptr)
-{
-    uintptr_t addr = (uintptr_t)ptr;
-    uintptr_t align_off = addr & (uintptr_t)3U;
-    const volatile void *word_ptr = (const volatile void *)(addr - align_off);
-    uint32_t word = ef_atomic_load_u32(word_ptr);
-
-    return (uint8_t)((word >> (align_off * 8U)) & 0xFFU);
-}
-
 static void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 {
     uintptr_t addr = (uintptr_t)ptr;
