@@ -36,6 +36,28 @@ static void expect_err(enum ef_err got, enum ef_err want, const char *msg)
     }
 }
 
+static int main_io_read(FILE *fp, void *buf, size_t nbytes)
+{
+    if (fp == NULL || buf == NULL) {
+        return 0;
+    }
+    return fread(buf, 1, nbytes, fp) == nbytes;
+}
+
+static int main_io_write(FILE *fp, const void *buf, size_t nbytes)
+{
+    if (fp == NULL) {
+        return 0;
+    }
+    if (nbytes == 0) {
+        return 1;
+    }
+    if (buf == NULL) {
+        return 0;
+    }
+    return fwrite(buf, 1, nbytes, fp) == nbytes;
+}
+
 static double now_seconds(void)
 {
 #ifdef _WIN32
@@ -730,7 +752,10 @@ static void test_bad_magic(void)
         return;
     }
 
-    fwrite(image, 1, file_size, fp);
+    if (!main_io_write(fp, image, file_size)) {
+        fprintf(stderr, "FAIL: write bad_magic.endf\n");
+        ++g_failures;
+    }
     fclose(fp);
     free(image);
 
@@ -950,10 +975,20 @@ static void test_superblock_checksum_reject(void)
 
     pos = (long)offsetof(struct ef_superblock, reserved);
     fseek(fp, pos, SEEK_SET);
-    fread(&byte, 1, 1, fp);
+    if (!main_io_read(fp, &byte, 1)) {
+        fprintf(stderr, "FAIL: read superblock tamper byte\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fseek(fp, pos, SEEK_SET);
     byte ^= 0xFFU;
-    fwrite(&byte, 1, 1, fp);
+    if (!main_io_write(fp, &byte, 1)) {
+        fprintf(stderr, "FAIL: write superblock tamper byte\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fclose(fp);
 
     err = ef_open_ex("test_crc.endf", 2, &db);
@@ -999,7 +1034,10 @@ static void test_v1_upgrade_file(void)
         ++g_failures;
         return;
     }
-    fwrite(image, 1, sizeof(image), fp);
+    if (!main_io_write(fp, image, sizeof(image))) {
+        fprintf(stderr, "FAIL: write test_v1.endf\n");
+        ++g_failures;
+    }
     fclose(fp);
 
     err = ef_open_ex("test_v1.endf", 4, &db);
@@ -1076,10 +1114,20 @@ static void test_slot_header_crc_persist_file(void)
     pos = (long)(sizeof(struct ef_superblock) + 2 * sizeof(struct ef_slot) +
                  offsetof(struct ef_slot, header_crc));
     fseek(fp, pos, SEEK_SET);
-    fread(&crc, sizeof(crc), 1, fp);
+    if (!main_io_read(fp, &crc, sizeof(crc))) {
+        fprintf(stderr, "FAIL: read slot header crc tamper\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fseek(fp, pos, SEEK_SET);
     crc ^= 0xDEADBEEFU;
-    fwrite(&crc, sizeof(crc), 1, fp);
+    if (!main_io_write(fp, &crc, sizeof(crc))) {
+        fprintf(stderr, "FAIL: write slot header crc tamper\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fclose(fp);
 
     err = ef_open_readonly_ex("test_slot_crc.endf", &db);
@@ -1139,10 +1187,20 @@ static void test_slot_header_crc_overflow_persist_file(void)
     pos = (long)(sizeof(struct ef_superblock) + ov_id * sizeof(struct ef_slot) +
                  offsetof(struct ef_slot, header_crc));
     fseek(fp, pos, SEEK_SET);
-    fread(&crc, sizeof(crc), 1, fp);
+    if (!main_io_read(fp, &crc, sizeof(crc))) {
+        fprintf(stderr, "FAIL: read overflow slot crc tamper\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fseek(fp, pos, SEEK_SET);
     crc ^= 0xBEEFU;
-    fwrite(&crc, sizeof(crc), 1, fp);
+    if (!main_io_write(fp, &crc, sizeof(crc))) {
+        fprintf(stderr, "FAIL: write overflow slot crc tamper\n");
+        fclose(fp);
+        ++g_failures;
+        return;
+    }
     fclose(fp);
 
     err = ef_open_readonly_ex("test_slot_crc_ov.endf", &db);

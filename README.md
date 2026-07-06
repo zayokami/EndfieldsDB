@@ -104,7 +104,7 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O |
+| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O；不构建 `endfields_test` |
 | `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
 | `ENDFIELDS_WARNINGS_AS_ERRORS` | OFF | `-Werror`（CI 开启） |
 | `ENDFIELDS_SANITIZE` | OFF | GCC/Clang：AddressSanitizer + UBSan |
