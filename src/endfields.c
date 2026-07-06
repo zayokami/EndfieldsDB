@@ -3,6 +3,7 @@
 #include "ef_port.h"
 #include "ef_crc.h"
 #include "ef_atomic_unaligned.h"
+#include "ef_sb_layout.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -16,11 +17,6 @@
 
 #define EF_CHASE_VISIT_CACHE 64U
 #define EF_SCHEMA_LEGACY 1U
-
-#define EF_SB_OFF_QUEUE_HEAD 4U
-#define EF_SB_OFF_QUEUE_TAIL 12U
-#define EF_SB_OFF_HASH_CAP  20U
-#define EF_SB_OFF_QUEUE_LOCK 24U
 
 #define EF_ATOMIC_STORE_U32(p, v) ef_atomic_store_u32((volatile void *)(p), (v))
 #define EF_ATOMIC_CAS_U32(p, expected, desired) \
@@ -327,22 +323,23 @@ static const uint64_t *ef_sb_queue_tail_ptr_ro(const struct ef_superblock *sb)
 #pragma GCC diagnostic pop
 #endif
 
-static uint32_t *ef_sb_hash_capacity_ptr(struct ef_superblock *sb)
-{
-    return (uint32_t *)&sb->reserved[EF_SB_OFF_HASH_CAP];
-}
-
 static uint32_t ef_hash_capacity_from_sb(const struct ef_superblock *sb)
 {
-    if (sb == NULL || sb->schema_version < EF_SCHEMA_VERSION) {
+    if (sb == NULL || sb->schema_version < EF_SCHEMA_VERSION_V3) {
         return 0;
     }
-    return *(const uint32_t *)&sb->reserved[EF_SB_OFF_HASH_CAP];
+    return ef_sb_hash_capacity_load(sb);
 }
 
 static int ef_hash_capacity_valid(uint32_t hash_capacity)
 {
-    return hash_capacity == 0 || (hash_capacity & (hash_capacity - 1U)) == 0;
+    if (hash_capacity == 0) {
+        return 1;
+    }
+    if (hash_capacity > 0xFFFFU) {
+        return 0;
+    }
+    return (hash_capacity & (hash_capacity - 1U)) == 0;
 }
 
 static int ef_slot_header_crc_valid(struct ef_db *db, uint64_t slot_id, const struct ef_slot *slot)
@@ -474,6 +471,7 @@ static enum ef_err ef_validate_superblock(const struct ef_superblock *sb, size_t
     if (sb->schema_version != 0 &&
         sb->schema_version != EF_SCHEMA_LEGACY &&
         sb->schema_version != EF_SCHEMA_VERSION_V2 &&
+        sb->schema_version != EF_SCHEMA_VERSION_V3 &&
         sb->schema_version != EF_SCHEMA_VERSION) {
         return EF_ERR_BAD_VERSION;
     }
@@ -507,7 +505,7 @@ static void ef_init_superblock(struct ef_superblock *sb, uint64_t max_slots, uin
     sb->flags = EF_FLAG_SB_CRC | EF_FLAG_SLOT_CRC;
     sb->free_count = max_slots;
     memset(sb->reserved, 0, sizeof(sb->reserved));
-    *ef_sb_hash_capacity_ptr(sb) = hash_capacity;
+    ef_sb_hash_capacity_store(sb, hash_capacity);
     ef_sb_checksum_store(sb);
 }
 
@@ -640,6 +638,15 @@ static enum ef_err ef_db_init_mapped(struct ef_db *db, int is_new_file, uint64_t
             /* Read-only mapping: use on-disk free list as-is; never write mmap. */
             return EF_OK;
         }
+        if (db->sb->schema_version == EF_SCHEMA_VERSION_V3 &&
+            ef_sb_hash_capacity_load(db->sb) > 0U) {
+            err = ef_sb_migrate_v3_index_layout(db->sb);
+            if (err != EF_OK) {
+                return err;
+            }
+            ef_db_bind_slots_layout(db);
+            ef_db_mark_meta_dirty(db);
+        }
         err = ef_rebuild_free_list(db);
         if (err != EF_OK) {
             return err;
@@ -711,6 +718,7 @@ const char *ef_strerror(enum ef_err err)
     case EF_ERR_QUEUE_EMPTY: return "queue is empty";
     case EF_ERR_QUEUE_BUSY: return "queue contended too long";
     case EF_ERR_INDEX_FULL: return "hash index is full";
+    case EF_ERR_INDEX_BUSY: return "hash index lock busy";
     default: return "unknown error";
     }
 }
@@ -1524,6 +1532,7 @@ int ef_needs_upgrade(const struct ef_db *db)
         return 0;
     }
     if (db->sb->schema_version == EF_SCHEMA_VERSION ||
+        db->sb->schema_version == EF_SCHEMA_VERSION_V3 ||
         db->sb->schema_version == EF_SCHEMA_VERSION_V2) {
         return (db->sb->flags & (EF_FLAG_SB_CRC | EF_FLAG_SLOT_CRC)) !=
                (EF_FLAG_SB_CRC | EF_FLAG_SLOT_CRC);
@@ -1550,6 +1559,7 @@ enum ef_err ef_upgrade(struct ef_db *db)
     }
 
     if (db->sb->schema_version != EF_SCHEMA_VERSION &&
+        db->sb->schema_version != EF_SCHEMA_VERSION_V3 &&
         db->sb->schema_version != EF_SCHEMA_VERSION_V2 &&
         db->sb->schema_version != EF_SCHEMA_LEGACY &&
         db->sb->schema_version != 0) {
@@ -2249,46 +2259,20 @@ static enum ef_err ef_queue_dummy_offset(struct ef_db *db, uint64_t *dummy_offse
     return EF_OK;
 }
 
-static volatile uint32_t *ef_sb_queue_lock_ptr(struct ef_superblock *sb)
-{
-    return (volatile uint32_t *)&sb->reserved[EF_SB_OFF_QUEUE_LOCK];
-}
-
 static enum ef_err ef_queue_lock_acquire(struct ef_db *db)
 {
-    volatile uint32_t *lock = ef_sb_queue_lock_ptr(db->sb);
-    uint32_t exp = 0;
-    uint32_t spins = 0;
+    enum ef_err err;
 
-#if defined(__GNUC__) || defined(__clang__)
-    for (;;) {
-        if (++spins > EF_QUEUE_SPIN_MAX) {
-            ef_set_error(db, EF_ERR_QUEUE_BUSY);
-            return EF_ERR_QUEUE_BUSY;
-        }
-        ef_queue_yield(spins);
-        exp = 0;
-        if (EF_ATOMIC_CAS_U32(lock, &exp, 1)) {
-            return EF_OK;
-        }
+    err = ef_sb_queue_lock_acquire(db->sb);
+    if (err != EF_OK) {
+        ef_set_error(db, err);
     }
-#else
-    if (*lock != 0) {
-        ef_set_error(db, EF_ERR_QUEUE_BUSY);
-        return EF_ERR_QUEUE_BUSY;
-    }
-    *lock = 1;
-    return EF_OK;
-#endif
+    return err;
 }
 
 static void ef_queue_lock_release(struct ef_db *db)
 {
-#if defined(__GNUC__) || defined(__clang__)
-    EF_ATOMIC_STORE_U32(ef_sb_queue_lock_ptr(db->sb), 0);
-#else
-    *ef_sb_queue_lock_ptr(db->sb) = 0;
-#endif
+    ef_sb_queue_lock_release(db->sb);
 }
 
 static enum ef_err ef_queue_enqueue_mpmc(struct ef_db *db, uint64_t slot_offset, uint64_t slot_id)

@@ -8,12 +8,51 @@
 |--------|-------------|--------------------------|------|
 | FIFO 队列 `ef_queue_*` | 支持 MPMC | 支持 MPMC | 超级块自旋锁 + 锁内摘链/归还 |
 | 空闲链 `ef_alloc*` / `ef_free_slot` | CAS 弹入/弹出（GCC/Clang） | 同左 | 与队列可并发 |
-| Robin Hood 索引 `ef_index_*` | **非线程安全** | **非线程安全** | 需外部互斥 |
+| Robin Hood 索引 `ef_index_get` | **多读**（schema v4+） | **多读** | mmap seqlock + 写自旋锁 |
+| 索引写 `ef_index_put/remove/rehash/clear` | **单写者**（互斥） | **单写者** | 同一时刻仅一个写临界区 |
 | 槽位读写 / 追逐 / blob | **非线程安全** | **非线程安全** | 需外部互斥 |
 | `ef_sync` / `ef_close` | 调用方串行化 | 调用方串行化 | 避免与其他写者并发 |
 | 超级块延迟 CRC | 与写路径共享 mmap | 与写路径共享 mmap | `ef_db_commit_meta` 非原子屏障 |
 
-**默认假设**：除队列与空闲链外，同一 `struct ef_db` 实例在同一时刻只有一个写者，或调用方自行加锁。
+**默认假设**：槽位数据与索引写操作外，队列与索引读可并发；索引写与 `ef_index_rehash` 同一时刻只能有一个执行者（可多线程排队抢写锁，但互斥执行）。
+
+## Schema v4 与索引 MRSW
+
+v4 在超级块 `reserved[]` 中增加（并压缩 v3 字段布局）：
+
+| 偏移 | 字段 | 用途 |
+|------|------|------|
+| `[20..21]` | `hash_capacity` u16 | 最大 65535 桶 |
+| `[22]` | `queue_lock` u8 | 队列自旋锁 |
+| `[23]` | `index_write_lock` u8 | 索引写自旋锁 |
+| `[24..27]` | `index_seq` u32 | seqlock：偶数=稳定，奇数=写者活跃 |
+
+**可写打开** v3 库时自动迁移到 v4（哈希容量 ≤ 65535）。**只读打开** v3 库不会改写 mmap，索引并发保护**不生效**——请先可写打开一次完成迁移，或接受单线程索引访问。
+
+### 读路径（`ef_index_get`）
+
+1. 读 `index_seq`；若为奇数则自旋重试。
+2. 探测 Robin Hood 表（不持锁）。
+3. 再读 `index_seq`；若与步骤 1 不同或仍为奇数则重试。
+4. 重试超过 `EF_SB_INDEX_SEQ_READ_MAX` 返回 `EF_ERR_INDEX_BUSY`（调用方应重试）。
+
+读侧**无**全局读锁，多个读者可并行。
+
+### 写路径（`put` / `remove` / `remove_by_slot` / `rehash` / `clear`）
+
+1. CAS 获取 `index_write_lock`（失败返回 `EF_ERR_INDEX_BUSY`）。
+2. `index_seq++`（变奇数）+ fence。
+3. 修改哈希表 / 搬迁槽区（`rehash` 全程持锁）。
+4. fence + `index_seq++`（变偶数）。
+5. 释放 `index_write_lock`。
+
+`ef_index_remove_by_slot`（由 `ef_free_slot`、队列出队等触发）同样走写锁，因此**多个线程可同时调用写 API，但会串行化**——语义是 single-writer-at-a-time，不是“只能一个线程 ID”。
+
+### 与队列 / 空闲链的交互
+
+- 读者可与 `ef_queue_push/pop`、空闲链 CAS **并发**。
+- 写者可能与队列并发；`remove_by_slot` 与消费者在出队归还槽位时争用写锁——设计预期，正确但可能 `EF_ERR_INDEX_BUSY`，需重试。
+- `ef_index_rehash` 会 `memmove` 槽区并修正 `free_list` / 队列头尾 / `next_offset`；持写锁期间读者重试，**调用方不得在 rehash 时并发写槽位**。
 
 ## FIFO 队列（MPMC）
 
@@ -47,37 +86,27 @@ for (;;) {
 }
 ```
 
-测试实现中在 `ef_queue_drained` 连续多次为真后才退出，以降低与最后几条消息的竞态。
-
 ### 入队失败
 
 若 `ef_queue_push` 在链接入队前失败（如 `EF_ERR_QUEUE_BUSY`），库内通过 `ef_return_slot_to_pool` 回收槽位（`ef_free_slot` 无法释放 `EF_STATUS_QUEUED` 槽）。
-
-### 槽位池容量
-
-队列深度受 `max_slots` 限制。高吞吐压测时，在途消息数可能接近「生产者数 × 每生产者消息数」；应保证 `max_slots` 大于峰值在途消息数（bench 使用 `消息总数 + 64`）。
 
 ## 空闲链与 `ef_alloc`
 
 - `ef_alloc_slot`：CAS 从 LIFO 空闲链弹出；失败返回 `EF_ERR_SLOT_FULL` 或 `EF_ERR_QUEUE_BUSY`（CAS 重试耗尽）。
 - `ef_alloc`：池空时 `ef_grow(+1)` 后重试。
-- `ef_free_slot`：归还空闲链并 `ef_index_remove_by_slot`；**不可**用于仍在队列中的 `EF_STATUS_QUEUED` 槽。
+- `ef_free_slot`：归还空闲链并 `ef_index_remove_by_slot`（索引写锁）；**不可**用于仍在队列中的 `EF_STATUS_QUEUED` 槽。
 
-与队列并发时：消费者 `pop` 归还槽位，生产者 `push` 分配槽位，由 CAS 与队列锁协同保证安全。
+## 槽位数据（仍须外部同步）
 
-## 索引与槽位数据（单写者）
+以下 API **未**做槽位级同步：
 
-以下 API **未**做内部同步，多线程并发读写会导致数据竞争与损坏：
-
-- `ef_index_put` / `ef_index_get` / `ef_index_remove` / `ef_index_rehash`
 - `ef_write_payload` / `ef_write_blob` / `ef_set_*` / `ef_chase*`
 - `ef_foreach_used` / `ef_slot_iter`
 
-**推荐模式**：
+索引 MRSW **不**保护槽内 payload。典型模式：
 
-1. **单写线程 + 多读线程**：读侧仍须与写者互斥，除非只读打开（`ef_open_readonly`）且无任何写者。
-2. **多写者**：调用方对整库或按子系统（索引区 / 槽区）使用互斥锁。
-3. **跨进程**：仅队列场景可多个进程无锁并发；索引与槽位写入应通过文件锁或单一「写进程」串行化。
+1. 写者：`ef_index_put` 后单线程写槽（或外部槽锁）。
+2. 读者：`ef_index_get` 得到 `slot_id` 后，在**无写者改该槽**的前提下读 `ef_get_slot` / payload；或只读 mmap 且无写进程。
 
 ## 持久化与崩溃窗口
 
@@ -89,14 +118,14 @@ for (;;) {
 
 | 平台 | 多线程测试 |
 |------|------------|
-| Windows | `test_queue_mpmc`（Win32 `_beginthreadex`） |
-| Linux / macOS 等 | `test_queue_mpmc`（pthread） |
+| Windows | `test_queue_mpmc`、`test_index_mrsr`（Win32 线程） |
+| Linux / macOS 等 | `test_queue_mpmc`、`test_index_mrsr`（pthread） |
 | 嵌入式 `EF_PLATFORM_EMBEDDED` | 跳过（无文件 I/O） |
 
 构建非 Windows 测试时需链接 pthread（CMake `Threads::Threads`）。
 
 ## 后续计划（未实现）
 
-- 索引读侧无锁或读写锁
+- 槽位读侧与索引读的原子组合 API
 - `ef_execute` 队列/索引操作码
-- 更短的队列临界区（retire 链批量归还）
+- 自动 `ef_index_rehash` 阈值

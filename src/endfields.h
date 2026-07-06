@@ -101,7 +101,8 @@ enum ef_err {
     EF_ERR_GROW,
     EF_ERR_QUEUE_EMPTY,
     EF_ERR_QUEUE_BUSY,
-    EF_ERR_INDEX_FULL
+    EF_ERR_INDEX_FULL,
+    EF_ERR_INDEX_BUSY
 };
 
 enum ef_backend {

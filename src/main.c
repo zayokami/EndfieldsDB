@@ -5,6 +5,8 @@
 #include "endfields.h"
 #include "ef_config.h"
 #include "ef_index.h"
+#include "ef_sb_layout.h"
+#include "ef_crc.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -1240,7 +1242,7 @@ static void test_v3_alloc_queue_index(void)
         return;
     }
 
-    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "v3 schema");
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "hash db schema v4");
     expect_true(db->hash_capacity == 16, "hash capacity bound");
     expect_true(db->slots_base == 64 + 16 * 16, "slots after hash region");
 
@@ -1546,6 +1548,390 @@ static int mpmc_join_threads_pthread(pthread_t *threads, int count, const char *
     return 1;
 }
 #endif
+
+#ifdef ENDFIELDS_CI_FAST
+#define EF_INDEX_MRSR_ROUNDS 1500
+#else
+#define EF_INDEX_MRSR_ROUNDS 8000
+#endif
+
+struct ef_index_mrsr_ctx {
+    struct ef_db *db;
+    int thread_id;
+    volatile long *errors;
+    volatile long *stop;
+};
+
+static void ef_index_mrsr_seed_keys(struct ef_db *db)
+{
+    uint32_t i;
+    char key[24];
+
+    for (i = 0; i < 32U; ++i) {
+        uint64_t slot_id = 0;
+        enum ef_err err;
+
+        snprintf(key, sizeof(key), "key-%02u", i);
+        err = ef_alloc(db, &slot_id);
+        if (err != EF_OK) {
+            return;
+        }
+        err = ef_write_payload(db, slot_id, key, (uint8_t)strlen(key));
+        if (err != EF_OK) {
+            return;
+        }
+        (void)ef_index_put(db, key, slot_id);
+    }
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall ef_index_mrsr_reader_win(void *arg)
+{
+    struct ef_index_mrsr_ctx *ctx = (struct ef_index_mrsr_ctx *)arg;
+    char key[24];
+    int round;
+
+    for (round = 0; round < EF_INDEX_MRSR_ROUNDS; ++round) {
+        uint32_t kid = (uint32_t)((ctx->thread_id * 97 + round) % 32);
+        uint64_t slot_id = 0;
+        enum ef_err err;
+
+        if (*ctx->stop) {
+            break;
+        }
+
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        err = ef_index_get(ctx->db, key, &slot_id);
+        if (err == EF_ERR_INDEX_BUSY || err == EF_ERR_NOT_FOUND) {
+            --round;
+            Sleep(0);
+            continue;
+        }
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        if (ef_get_slot(ctx->db, slot_id) == NULL) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+    }
+    return 0;
+}
+
+static unsigned __stdcall ef_index_mrsr_writer_win(void *arg)
+{
+    struct ef_index_mrsr_ctx *ctx = (struct ef_index_mrsr_ctx *)arg;
+    char key[24];
+    int round;
+
+    for (round = 0; round < EF_INDEX_MRSR_ROUNDS / 8; ++round) {
+        uint32_t kid = (uint32_t)(round % 32U);
+        uint64_t slot_id = 0;
+        enum ef_err err;
+        int attempt;
+
+        if (*ctx->stop) {
+            break;
+        }
+
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        for (attempt = 0; attempt < 64; ++attempt) {
+            err = ef_index_get(ctx->db, key, &slot_id);
+            if (err == EF_ERR_INDEX_BUSY) {
+                Sleep(0);
+                continue;
+            }
+            break;
+        }
+        if (err == EF_OK) {
+            for (attempt = 0; attempt < 64; ++attempt) {
+                err = ef_index_remove(ctx->db, key);
+                if (err == EF_ERR_INDEX_BUSY) {
+                    Sleep(0);
+                    continue;
+                }
+                break;
+            }
+            if (err != EF_OK && err != EF_ERR_NOT_FOUND) {
+                mpmc_atomic_inc(ctx->errors);
+                break;
+            }
+            (void)ef_free_slot(ctx->db, slot_id);
+        }
+
+        err = ef_alloc(ctx->db, &slot_id);
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        err = ef_write_payload(ctx->db, slot_id, key, (uint8_t)strlen(key));
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        for (attempt = 0; attempt < 64; ++attempt) {
+            err = ef_index_put(ctx->db, key, slot_id);
+            if (err == EF_ERR_INDEX_BUSY) {
+                Sleep(0);
+                continue;
+            }
+            break;
+        }
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+    }
+
+    *ctx->stop = 1;
+    return 0;
+}
+#else
+static void *ef_index_mrsr_reader_pthread(void *arg)
+{
+    struct ef_index_mrsr_ctx *ctx = (struct ef_index_mrsr_ctx *)arg;
+    char key[24];
+    int round;
+
+    for (round = 0; round < EF_INDEX_MRSR_ROUNDS; ++round) {
+        uint32_t kid = (uint32_t)((ctx->thread_id * 97 + round) % 32);
+        uint64_t slot_id = 0;
+        enum ef_err err;
+
+        if (*ctx->stop) {
+            break;
+        }
+
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        err = ef_index_get(ctx->db, key, &slot_id);
+        if (err == EF_ERR_INDEX_BUSY || err == EF_ERR_NOT_FOUND) {
+            --round;
+            sched_yield();
+            continue;
+        }
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        if (ef_get_slot(ctx->db, slot_id) == NULL) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void *ef_index_mrsr_writer_pthread(void *arg)
+{
+    struct ef_index_mrsr_ctx *ctx = (struct ef_index_mrsr_ctx *)arg;
+    char key[24];
+    int round;
+
+    for (round = 0; round < EF_INDEX_MRSR_ROUNDS / 8; ++round) {
+        uint32_t kid = (uint32_t)(round % 32U);
+        uint64_t slot_id = 0;
+        enum ef_err err;
+        int attempt;
+
+        if (*ctx->stop) {
+            break;
+        }
+
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        for (attempt = 0; attempt < 64; ++attempt) {
+            err = ef_index_get(ctx->db, key, &slot_id);
+            if (err == EF_ERR_INDEX_BUSY) {
+                sched_yield();
+                continue;
+            }
+            break;
+        }
+        if (err == EF_OK) {
+            for (attempt = 0; attempt < 64; ++attempt) {
+                err = ef_index_remove(ctx->db, key);
+                if (err == EF_ERR_INDEX_BUSY) {
+                    sched_yield();
+                    continue;
+                }
+                break;
+            }
+            if (err != EF_OK && err != EF_ERR_NOT_FOUND) {
+                mpmc_atomic_inc(ctx->errors);
+                break;
+            }
+            (void)ef_free_slot(ctx->db, slot_id);
+        }
+
+        err = ef_alloc(ctx->db, &slot_id);
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        snprintf(key, sizeof(key), "key-%02u", kid);
+        err = ef_write_payload(ctx->db, slot_id, key, (uint8_t)strlen(key));
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+        for (attempt = 0; attempt < 64; ++attempt) {
+            err = ef_index_put(ctx->db, key, slot_id);
+            if (err == EF_ERR_INDEX_BUSY) {
+                sched_yield();
+                continue;
+            }
+            break;
+        }
+        if (err != EF_OK) {
+            mpmc_atomic_inc(ctx->errors);
+            break;
+        }
+    }
+
+    *ctx->stop = 1;
+    return NULL;
+}
+#endif
+
+static void test_sb_checksum_store(struct ef_superblock *sb)
+{
+    uint32_t crc;
+    uint32_t zero_crc = 0;
+
+    if (!(sb->flags & EF_FLAG_SB_CRC)) {
+        return;
+    }
+
+    crc = ef_crc32_update(0xFFFFFFFFU, sb, offsetof(struct ef_superblock, reserved));
+    crc = ef_crc32_update(crc, &zero_crc, sizeof(zero_crc));
+    crc = ef_crc32_update(crc, sb->reserved + sizeof(uint32_t),
+                          sizeof(sb->reserved) - sizeof(uint32_t));
+    *(uint32_t *)&sb->reserved[0] = crc ^ 0xFFFFFFFFU;
+}
+
+static void test_v3_to_v4_index_migration(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id = 0;
+    uint64_t looked = 0;
+    const char *key = "migrate-me";
+
+    printf("\n=== v3->v4: index layout migration ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 1, &db);
+    expect_err(err, EF_OK, "migration seed open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "migration seed alloc");
+    err = ef_write_payload(db, slot_id, key, (uint8_t)strlen(key));
+    expect_err(err, EF_OK, "migration seed payload");
+    err = ef_index_put(db, key, slot_id);
+    expect_err(err, EF_OK, "migration seed index put");
+    ef_close(db);
+
+    {
+        struct ef_superblock *sb = (struct ef_superblock *)arena;
+        uint32_t hash32 = 16U;
+        uint32_t queue_lock32 = 0U;
+
+        sb->schema_version = EF_SCHEMA_VERSION_V3;
+        memcpy(&sb->reserved[EF_SB_OFF_HASH_CAP_V3], &hash32, sizeof(hash32));
+        memcpy(&sb->reserved[EF_SB_OFF_QUEUE_LOCK_V3], &queue_lock32, sizeof(queue_lock32));
+        test_sb_checksum_store(sb);
+    }
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 0, &db);
+    expect_err(err, EF_OK, "migration reopen writable");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "migrated schema v4");
+    expect_true(db->hash_capacity == 16U, "migrated hash capacity");
+    expect_true(ef_sb_index_seq_load(db->sb) == 0U, "migrated index seq zero");
+
+    err = ef_index_get(db, key, &looked);
+    expect_err(err, EF_OK, "migration index lookup");
+    expect_true(looked == slot_id, "migration slot id preserved");
+
+    ef_close(db);
+}
+
+static void test_index_mrsr(void)
+{
+    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct ef_index_mrsr_ctx ctx[5];
+    volatile long errors = 0;
+    volatile long stop = 0;
+    uint32_t i;
+#if defined(_WIN32)
+    HANDLE threads[5];
+#else
+    pthread_t threads[5];
+#endif
+
+    printf("\n=== v4: index MRSW (4 readers + 1 writer) ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 128, 64, 1, &db);
+    expect_err(err, EF_OK, "mrsr open");
+    expect_true(db != NULL, "mrsr db");
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "mrsr schema v4");
+    if (db == NULL) {
+        return;
+    }
+
+    ef_index_mrsr_seed_keys(db);
+
+    for (i = 0; i < 5; ++i) {
+        ctx[i].db = db;
+        ctx[i].thread_id = (int)i;
+        ctx[i].errors = &errors;
+        ctx[i].stop = &stop;
+#if defined(_WIN32)
+        threads[i] = (HANDLE)_beginthreadex(
+            NULL, 0,
+            (i < 4) ? ef_index_mrsr_reader_win : ef_index_mrsr_writer_win,
+            &ctx[i], 0, NULL);
+        if (threads[i] == NULL) {
+            expect_true(0, "mrsr thread create");
+            ef_close(db);
+            return;
+        }
+#else
+        if (pthread_create(&threads[i], NULL,
+                           (i < 4) ? ef_index_mrsr_reader_pthread : ef_index_mrsr_writer_pthread,
+                           &ctx[i]) != 0) {
+            expect_true(0, "mrsr thread create");
+            ef_close(db);
+            return;
+        }
+#endif
+    }
+
+#if defined(_WIN32)
+    if (!mpmc_join_threads_win32(threads, 5, 60000, "test_index_mrsr")) {
+        expect_true(0, "mrsr threads finished");
+    }
+    for (i = 0; i < 5; ++i) {
+        CloseHandle(threads[i]);
+    }
+#else
+    if (!mpmc_join_threads_pthread(threads, 5, "test_index_mrsr")) {
+        expect_true(0, "mrsr threads finished");
+    }
+#endif
+
+    expect_true(errors == 0, "mrsr reader/writer errors");
+    ef_close(db);
+}
 
 static void test_queue_mpmc(void)
 {
@@ -2510,6 +2896,8 @@ int main(void)
     test_v3_alloc_queue_index();
     test_index_lifecycle_and_rehash();
 #if EF_HAS_FILE_IO
+    test_v3_to_v4_index_migration();
+    test_index_mrsr();
     test_queue_mpmc();
 #endif
 

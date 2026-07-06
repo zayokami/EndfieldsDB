@@ -16,6 +16,11 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     message(WARNING "Recommended compiler is GCC or Clang; current: ${CMAKE_C_COMPILER_ID}")
 endif()
 
+# MinGW gcc can fail silently when include paths are passed via @response files (CRLF).
+if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(CMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+endif()
+
 if(MSVC)
     add_compile_options(/W4)
     if(ENDFIELDS_WARNINGS_AS_ERRORS)
@@ -44,6 +49,7 @@ set(ENDFIELDS_LIB_SOURCES
     src/ef_port.c
     src/ef_crc.c
     src/ef_index.c
+    src/ef_sb_layout.c
 )
 
 function(endfields_apply_target_options target_name)
