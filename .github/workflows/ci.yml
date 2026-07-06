@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STRICT_CMAKE_FLAGS: >-
+    -DENDFIELDS_WARNINGS_AS_ERRORS=ON
+    -DENDFIELDS_CI_FAST=ON
+
+jobs:
+  linux-gcc:
+    name: Linux GCC / ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - id: release
+            build_type: Release
+            sanitize: OFF
+            prefetch: ON
+          - id: debug
+            build_type: Debug
+            sanitize: OFF
+            prefetch: ON
+          - id: no-prefetch
+            build_type: Release
+            sanitize: OFF
+            prefetch: OFF
+          - id: asan-ubsan
+            build_type: Debug
+            sanitize: ON
+            prefetch: ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DENDFIELDS_ENABLE_PREFETCH=${{ matrix.prefetch }}
+          -DENDFIELDS_SANITIZE=${{ matrix.sanitize }}
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  linux-clang:
+    name: Linux Clang / Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake clang
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  macos-clang:
+    name: macOS Clang / Release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  windows-mingw:
+    name: Windows MinGW / Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -G "MinGW Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  windows-mingw-debug:
+    name: Windows MinGW / Debug
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -G "MinGW Makefiles"
+          -DCMAKE_BUILD_TYPE=Debug
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+
+  embedded:
+    name: Linux embedded-only / Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: Configure
+        run: >
+          cmake -B build-embedded
+          -DENDFIELDS_EMBEDDED_ONLY=ON
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ env.STRICT_CMAKE_FLAGS }}
+
+      - name: Build
+        run: cmake --build build-embedded --parallel
+
+      - name: Test
+        run: ctest --test-dir build-embedded --output-on-failure --timeout 300 --no-tests=error
+
+  ci-summary:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs:
+      - linux-gcc
+      - linux-clang
+      - macos-clang
+      - windows-mingw
+      - windows-mingw-debug
+      - embedded
+    if: always()
+    steps:
+      - name: Require all jobs
+        run: |
+          test "${{ needs.linux-gcc.result }}" = "success"
+          test "${{ needs.linux-clang.result }}" = "success"
+          test "${{ needs.macos-clang.result }}" = "success"
+          test "${{ needs.windows-mingw.result }}" = "success"
+          test "${{ needs.windows-mingw-debug.result }}" = "success"
+          test "${{ needs.embedded.result }}" = "success"

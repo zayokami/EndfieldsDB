@@ -1,5 +1,7 @@
 # Endfields DB
 
+[![CI](https://github.com/zayokami/EndfieldsDB/actions/workflows/ci.yml/badge.svg)](https://github.com/zayokami/EndfieldsDB/actions/workflows/ci.yml)
+
 轻量级、零拷贝、基于 mmap 物理寻址的嵌入式数据库核心，使用 C11 实现。
 
 ## 特性
@@ -52,6 +54,39 @@ cmake --build build
 ctest --test-dir build
 ```
 
+Linux（GCC）：
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+```
+
+### CI（严格模式）
+
+push/PR 到 `main` 时自动运行 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
+
+| Job | 配置 |
+|-----|------|
+| Linux GCC | Release、Debug、无 prefetch、ASan+UBSan |
+| Linux Clang | Release |
+| macOS Clang | Release |
+| Windows MinGW | Release、Debug |
+| embedded-only | `ENDFIELDS_EMBEDDED_ONLY=ON` |
+
+所有 job 启用 **`-Werror`**（`ENDFIELDS_WARNINGS_AS_ERRORS=ON`）与 **CI 快速 bench**（`ENDFIELDS_CI_FAST=ON`，功能测试不变）。`ctest` 使用 `--timeout 900` 与 `--no-tests=error`。
+
+本地复现严格 CI：
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DENDFIELDS_WARNINGS_AS_ERRORS=ON -DENDFIELDS_CI_FAST=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+建议在 GitHub 仓库 **Settings → Branches → Branch protection** 中将 `CI gate` 设为 required check。
+
 产物：
 
 - `libendfields.a` — 文件 + 内存后端
@@ -71,6 +106,9 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 |------|------|------|
 | `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O |
 | `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
+| `ENDFIELDS_WARNINGS_AS_ERRORS` | OFF | `-Werror`（CI 开启） |
+| `ENDFIELDS_SANITIZE` | OFF | GCC/Clang：AddressSanitizer + UBSan |
+| `ENDFIELDS_CI_FAST` | OFF | 缩短 bench 轮次（CI 开启，功能测试不变） |
 
 内存后端 `ef_grow` 在 `map_capacity` 范围内扩展 `file_size`；`ef_open_memory` 重开时会按超级块中的 `max_slots` 自动识别已扩容大小。
 

@@ -1317,7 +1317,15 @@ static void test_index_lifecycle_and_rehash(void)
     ef_close(db);
 }
 
+#ifdef ENDFIELDS_CI_FAST
+#define BENCH_ROUNDS 3
+#define BENCH_MPMC_ROUNDS 2
+#define BENCH_MPMC_PER_PRODUCER 500
+#else
 #define BENCH_ROUNDS 15
+#define BENCH_MPMC_ROUNDS 5
+#define BENCH_MPMC_PER_PRODUCER 2000
+#endif
 #define BENCH_MAX_ROUNDS 32
 #define EF_RUN_BENCH_MPMC 1
 
@@ -1654,8 +1662,8 @@ static void bench_mpmc_throughput(volatile uintptr_t *sink)
     double sec[BENCH_MAX_ROUNDS];
     struct bench_mpmc_ctx ctx[4];
     static volatile long producers_done;
-    const int per_producer = 2000;
-    const int mpmc_rounds = 5;
+    const int per_producer = BENCH_MPMC_PER_PRODUCER;
+    const int mpmc_rounds = BENCH_MPMC_ROUNDS;
     const uint64_t total_ops = (uint64_t)(per_producer * 2);
     const uint64_t bench_slots = total_ops + 64U;
     int r;
