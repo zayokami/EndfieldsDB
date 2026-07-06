@@ -12,8 +12,6 @@
 #include <string.h>
 #include <stdalign.h>
 
-#include "ef_atomic_unaligned.h"
-
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -1417,15 +1415,10 @@ static void mpmc_atomic_inc(volatile long *value)
 {
 #if defined(_WIN32)
     InterlockedIncrement(value);
+#elif defined(__GNUC__) || defined(__clang__)
+    (void)__atomic_fetch_add(value, 1L, __ATOMIC_SEQ_CST);
 #else
-    uint64_t cur;
-
-    for (;;) {
-        memcpy(&cur, (const void *)value, sizeof(cur));
-        if (ef_atomic_cas_u64((volatile void *)value, &cur, (uint64_t)(cur + 1L))) {
-            return;
-        }
-    }
+    *value += 1L;
 #endif
 }
 
