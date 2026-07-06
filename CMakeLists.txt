@@ -79,6 +79,15 @@ set(ENDFIELDS_LIB_SOURCES
     src/ef_sb_layout.c
 )
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86|x86")
+    list(APPEND ENDFIELDS_LIB_SOURCES src/ef_crc_pclmul.c)
+    if(MSVC)
+        set_source_files_properties(src/ef_crc_pclmul.c PROPERTIES COMPILE_FLAGS "/arch:AVX")
+    elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set_source_files_properties(src/ef_crc_pclmul.c PROPERTIES COMPILE_FLAGS "-msse4.2 -mpclmul -mssse3")
+    endif()
+endif()
+
 function(endfields_apply_target_options target_name)
     if(ENDFIELDS_ENABLE_PREFETCH)
         target_compile_definitions(${target_name} PUBLIC EF_ENABLE_PREFETCH)

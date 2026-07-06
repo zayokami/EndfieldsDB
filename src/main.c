@@ -7,6 +7,7 @@
 #include "ef_index.h"
 #include "ef_sb_layout.h"
 #include "ef_crc.h"
+#include "ef_crc_internal.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -2920,6 +2921,45 @@ static void run_memory_engineering(void)
     }
 }
 
+static void test_crc32_pclmul_consistency(void)
+{
+    static uint8_t buf[512];
+    size_t i;
+    size_t n;
+    uint32_t vec;
+
+    vec = ef_crc32("123456789", 9);
+    expect_true(vec == 0xCBF43926U, "crc32 IEEE test vector");
+
+    for (i = 0; i < sizeof(buf); ++i) {
+        buf[i] = (uint8_t)(i * 131U + 17U);
+    }
+
+#if defined(__x86_64__) || defined(_M_X64)
+    if (!ef_crc32_pclmul_available()) {
+        printf("  (crc pclmul unavailable on this CPU, slice4 only)\n");
+        return;
+    }
+
+    for (n = 1; n <= sizeof(buf); ++n) {
+        uint32_t sw = ef_crc32_update_slice4(0xFFFFFFFFU, buf, n);
+        uint32_t hw = ef_crc32_update_pclmul(0xFFFFFFFFU, buf, n);
+
+        if (sw != hw) {
+            fprintf(stderr, "FAIL: pclmul mismatch len=%zu sw=%08x hw=%08x\n",
+                    n, sw, hw);
+            ++g_failures;
+            return;
+        }
+    }
+    printf("  crc32 pclmul matches slice4 for 1..%zu bytes\n", sizeof(buf));
+#else
+    (void)n;
+    (void)i;
+    (void)buf;
+#endif
+}
+
 int main(void)
 {
     struct ef_db *db = NULL;
@@ -2927,6 +2967,7 @@ int main(void)
 
     printf("platform: %s\n", ef_platform_name());
 
+    test_crc32_pclmul_consistency();
     test_memory_backend();
     test_slot_iterator_memory();
     test_blob_memory();

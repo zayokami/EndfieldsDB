@@ -1,6 +1,10 @@
 #include "ef_crc.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+
+#include "ef_crc_internal.h"
 
 /* IEEE CRC-32 (reflected 0xEDB88320). SSE4.2 _mm_crc32_* is CRC-32C and must NOT be used here. */
 
@@ -50,7 +54,7 @@ static void ef_crc32_ensure_init(void)
     }
 }
 
-uint32_t ef_crc32_update(uint32_t crc, const void *data, size_t len)
+uint32_t ef_crc32_update_slice4(uint32_t crc, const void *data, size_t len)
 {
     const uint8_t *bytes = (const uint8_t *)data;
     uint32_t word;
@@ -60,10 +64,10 @@ uint32_t ef_crc32_update(uint32_t crc, const void *data, size_t len)
     while (len >= 4U) {
         memcpy(&word, bytes, sizeof(word));
         crc ^= word;
-        crc = ef_crc32_slice3[(crc >> 24) & 0xFFU] ^
-              ef_crc32_slice2[(crc >> 16) & 0xFFU] ^
-              ef_crc32_slice1[(crc >> 8) & 0xFFU] ^
-              ef_crc32_slice0[crc & 0xFFU];
+        crc = ef_crc32_slice0[(crc >> 24) & 0xFFU] ^
+              ef_crc32_slice1[(crc >> 16) & 0xFFU] ^
+              ef_crc32_slice2[(crc >> 8) & 0xFFU] ^
+              ef_crc32_slice3[crc & 0xFFU];
         bytes += 4;
         len -= 4U;
     }
@@ -75,6 +79,16 @@ uint32_t ef_crc32_update(uint32_t crc, const void *data, size_t len)
     }
 
     return crc;
+}
+
+uint32_t ef_crc32_update(uint32_t crc, const void *data, size_t len)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    if (len >= 64U && ef_crc32_pclmul_available()) {
+        return ef_crc32_update_pclmul(crc, data, len);
+    }
+#endif
+    return ef_crc32_update_slice4(crc, data, len);
 }
 
 uint32_t ef_crc32(const void *data, size_t len)
