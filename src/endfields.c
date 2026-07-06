@@ -22,15 +22,6 @@
 #define EF_SB_OFF_QUEUE_LOCK 24U
 
 #if defined(__GNUC__) || defined(__clang__)
-static uint32_t ef_atomic_load_u32(const volatile void *ptr)
-{
-    uint32_t value;
-
-    memcpy(&value, (const void *)ptr, sizeof(value));
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return value;
-}
-
 static void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
 {
     __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -92,7 +83,6 @@ static int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t de
     }
 }
 
-#define EF_ATOMIC_LOAD_U32(p)  ef_atomic_load_u32((const volatile void *)(p))
 #define EF_ATOMIC_STORE_U32(p, v) ef_atomic_store_u32((volatile void *)(p), (v))
 #define EF_ATOMIC_CAS_U32(p, expected, desired) \
     ef_atomic_cas_u32((volatile void *)(p), (expected), (desired))
@@ -102,7 +92,6 @@ static int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t de
     ef_atomic_cas_u64((volatile void *)(p), (expected), (desired))
 #define EF_ATOMIC_THREAD_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #else
-#define EF_ATOMIC_LOAD_U32(p)  (*(p))
 #define EF_ATOMIC_STORE_U32(p, v) (*(p) = (v))
 #define EF_ATOMIC_CAS_U32(p, expected, desired) \
     ((*(expected) == *(p)) ? ((*(p) = (desired)), 1) : 0)
