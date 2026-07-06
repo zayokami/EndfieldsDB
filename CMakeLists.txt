@@ -51,7 +51,7 @@ if(ENDFIELDS_COVERAGE)
     if(NOT (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
         message(FATAL_ERROR "ENDFIELDS_COVERAGE requires GCC or Clang")
     endif()
-    add_compile_options(-O0 --coverage)
+    add_compile_options(-O0 --coverage -fprofile-update=atomic)
     add_link_options(--coverage)
 endif()
 
