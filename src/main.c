@@ -1317,19 +1317,37 @@ static void test_index_lifecycle_and_rehash(void)
     ef_close(db);
 }
 
+#define BENCH_ROUNDS 15
+#define BENCH_MAX_ROUNDS 32
+#define EF_RUN_BENCH_MPMC 1
+
+#if EF_HAS_FILE_IO
+
 #if defined(_WIN32)
 #include <process.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <pthread.h>
+#include <sched.h>
+#else
+#error "MPMC tests require Win32 threads or pthread (GCC/Clang)"
+#endif
 
-static int win32_join_threads(HANDLE *threads, DWORD count, DWORD timeout_ms, const char *label)
+static void mpmc_thread_yield(void)
 {
-    DWORD wr;
+#if defined(_WIN32)
+    Sleep(0);
+#else
+    (void)sched_yield();
+#endif
+}
 
-    wr = WaitForMultipleObjects(count, threads, TRUE, timeout_ms);
-    if (wr != WAIT_FAILED && wr != WAIT_TIMEOUT && (wr - WAIT_OBJECT_0) < count) {
-        return 1;
-    }
-    fprintf(stderr, "%s: thread join failed (wr=%lu)\n", label, (unsigned long)wr);
-    return 0;
+static void mpmc_atomic_inc(volatile long *value)
+{
+#if defined(_WIN32)
+    InterlockedIncrement(value);
+#else
+    (void)__atomic_fetch_add(value, 1, __ATOMIC_SEQ_CST);
+#endif
 }
 
 static int mpmc_producers_finished(const volatile long *done, int producer_count)
@@ -1348,7 +1366,7 @@ static int mpmc_consumer_should_exit(struct ef_db *db, const volatile long *done
         if (!ef_queue_drained(db)) {
             return 0;
         }
-        Sleep(0);
+        mpmc_thread_yield();
     }
     return ef_queue_drained(db);
 }
@@ -1361,14 +1379,13 @@ struct ef_mpmc_ctx {
     volatile long *producers_done;
 };
 
-static unsigned __stdcall ef_mpmc_producer(void *arg)
+static void ef_mpmc_producer_body(struct ef_mpmc_ctx *ctx)
 {
-    struct ef_mpmc_ctx *ctx = (struct ef_mpmc_ctx *)arg;
     int i;
     uint8_t payload[5];
 
     for (i = 0; i < ctx->count; ++i) {
-        uint32_t id = (uint32_t)(ctx->thread_id * 100000 + i);
+        uint32_t id = (uint32_t)(ctx->thread_id * 100000 + (uint32_t)i);
         enum ef_err err;
         memcpy(payload, &id, sizeof(id));
         payload[4] = 0;
@@ -1376,13 +1393,11 @@ static unsigned __stdcall ef_mpmc_producer(void *arg)
             err = ef_queue_push(ctx->db, payload, 4);
         } while (err != EF_OK);
     }
-    InterlockedIncrement(ctx->producers_done);
-    return 0;
+    mpmc_atomic_inc(ctx->producers_done);
 }
 
-static unsigned __stdcall ef_mpmc_consumer(void *arg)
+static void ef_mpmc_consumer_body(struct ef_mpmc_ctx *ctx)
 {
-    struct ef_mpmc_ctx *ctx = (struct ef_mpmc_ctx *)arg;
     uint8_t buf[8];
     size_t len = 0;
     enum ef_err err;
@@ -1402,26 +1417,85 @@ static unsigned __stdcall ef_mpmc_consumer(void *arg)
             uint32_t id = 0;
             memcpy(&id, buf, sizeof(id));
             if (id < 400000U) {
-                InterlockedIncrement(&ctx->received[id]);
+                mpmc_atomic_inc(&ctx->received[id]);
             }
         }
     }
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall ef_mpmc_producer_win(void *arg)
+{
+    ef_mpmc_producer_body((struct ef_mpmc_ctx *)arg);
     return 0;
 }
+
+static unsigned __stdcall ef_mpmc_consumer_win(void *arg)
+{
+    ef_mpmc_consumer_body((struct ef_mpmc_ctx *)arg);
+    return 0;
+}
+
+static int mpmc_join_threads_win32(HANDLE *threads, DWORD count, DWORD timeout_ms, const char *label)
+{
+    DWORD wr;
+
+    wr = WaitForMultipleObjects(count, threads, TRUE, timeout_ms);
+    if (wr != WAIT_FAILED && wr != WAIT_TIMEOUT && (wr - WAIT_OBJECT_0) < count) {
+        return 1;
+    }
+    fprintf(stderr, "%s: thread join failed (wr=%lu)\n", label, (unsigned long)wr);
+    return 0;
+}
+#else
+static void *ef_mpmc_producer_pthread(void *arg)
+{
+    ef_mpmc_producer_body((struct ef_mpmc_ctx *)arg);
+    return NULL;
+}
+
+static void *ef_mpmc_consumer_pthread(void *arg)
+{
+    ef_mpmc_consumer_body((struct ef_mpmc_ctx *)arg);
+    return NULL;
+}
+
+static int mpmc_join_threads_pthread(pthread_t *threads, int count, const char *label)
+{
+    int i;
+
+    for (i = 0; i < count; ++i) {
+        int rc = pthread_join(threads[i], NULL);
+        if (rc != 0) {
+            fprintf(stderr, "%s: pthread_join[%d] failed (%d)\n", label, i, rc);
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 static void test_queue_mpmc(void)
 {
     struct ef_db *db = NULL;
     enum ef_err err;
-    HANDLE threads[4];
     struct ef_mpmc_ctx ctx[4];
     static volatile long received[400000];
     volatile long producers_done = 0;
     uint32_t i;
     long total = 0;
     long dupes = 0;
+#if defined(_WIN32)
+    HANDLE threads[4];
+#else
+    pthread_t threads[4];
+#endif
 
-    printf("\n=== v3: MPMC queue (4 threads) ===\n");
+#if defined(_WIN32)
+    printf("\n=== v3: MPMC queue (4 threads, Win32) ===\n");
+#else
+    printf("\n=== v3: MPMC queue (4 threads, pthread) ===\n");
+#endif
 
     memset((void *)received, 0, sizeof(received));
     remove_test_file("test_mpmc.endf");
@@ -1437,8 +1511,9 @@ static void test_queue_mpmc(void)
         ctx[i].count = (i < 2) ? 200 : 0;
         ctx[i].received = received;
         ctx[i].producers_done = &producers_done;
+#if defined(_WIN32)
         threads[i] = (HANDLE)_beginthreadex(NULL, 0,
-                                            (i < 2) ? ef_mpmc_producer : ef_mpmc_consumer,
+                                            (i < 2) ? ef_mpmc_producer_win : ef_mpmc_consumer_win,
                                             &ctx[i], 0, NULL);
         if (threads[i] == NULL) {
             expect_true(0, "mpmc thread create");
@@ -1446,9 +1521,20 @@ static void test_queue_mpmc(void)
             remove_test_file("test_mpmc.endf");
             return;
         }
+#else
+        if (pthread_create(&threads[i], NULL,
+                           (i < 2) ? ef_mpmc_producer_pthread : ef_mpmc_consumer_pthread,
+                           &ctx[i]) != 0) {
+            expect_true(0, "mpmc thread create");
+            ef_close(db);
+            remove_test_file("test_mpmc.endf");
+            return;
+        }
+#endif
     }
 
-    if (!win32_join_threads(threads, 4, 60000, "test_queue_mpmc")) {
+#if defined(_WIN32)
+    if (!mpmc_join_threads_win32(threads, 4, 60000, "test_queue_mpmc")) {
         expect_true(0, "mpmc threads finished");
         for (i = 0; i < 4; ++i) {
             if (threads[i] != NULL) {
@@ -1462,6 +1548,14 @@ static void test_queue_mpmc(void)
     for (i = 0; i < 4; ++i) {
         CloseHandle(threads[i]);
     }
+#else
+    if (!mpmc_join_threads_pthread(threads, 4, "test_queue_mpmc")) {
+        expect_true(0, "mpmc threads finished");
+        ef_close(db);
+        remove_test_file("test_mpmc.endf");
+        return;
+    }
+#endif
 
     for (i = 0; i < 400; ++i) {
         uint32_t id = (i < 200) ? i : (100000U + (i - 200));
@@ -1477,12 +1571,197 @@ static void test_queue_mpmc(void)
     ef_close(db);
     remove_test_file("test_mpmc.endf");
 }
-#else
-static void test_queue_mpmc(void)
+
+#if EF_RUN_BENCH_MPMC
+
+struct bench_mpmc_ctx {
+    struct ef_db *db;
+    int tid;
+    int count;
+    volatile long *received;
+    volatile long *done;
+};
+
+static void bench_mpmc_producer_body(struct bench_mpmc_ctx *ctx)
 {
-    printf("\n=== v3: MPMC queue (skipped on non-Windows) ===\n");
+    uint8_t payload[5];
+    int i;
+
+    for (i = 0; i < ctx->count; ++i) {
+        uint32_t id = (uint32_t)(ctx->tid * 100000 + (uint32_t)i);
+        enum ef_err err;
+        memcpy(payload, &id, sizeof(id));
+        do {
+            err = ef_queue_push(ctx->db, payload, 4);
+        } while (err != EF_OK);
+    }
+    mpmc_atomic_inc(ctx->done);
+}
+
+static void bench_mpmc_consumer_body(struct bench_mpmc_ctx *ctx)
+{
+    uint8_t buf[8];
+    size_t len;
+
+    for (;;) {
+        enum ef_err err = ef_queue_pop(ctx->db, buf, sizeof(buf), &len);
+        if (err == EF_ERR_QUEUE_EMPTY || err == EF_ERR_NOT_FOUND) {
+            if (mpmc_consumer_should_exit(ctx->db, ctx->done, 2)) {
+                break;
+            }
+            continue;
+        }
+        if (err == EF_ERR_QUEUE_BUSY) {
+            continue;
+        }
+        (void)len;
+    }
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall bench_mpmc_producer_win(void *arg)
+{
+    bench_mpmc_producer_body((struct bench_mpmc_ctx *)arg);
+    return 0;
+}
+
+static unsigned __stdcall bench_mpmc_consumer_win(void *arg)
+{
+    bench_mpmc_consumer_body((struct bench_mpmc_ctx *)arg);
+    return 0;
+}
+#else
+static void *bench_mpmc_producer_pthread(void *arg)
+{
+    bench_mpmc_producer_body((struct bench_mpmc_ctx *)arg);
+    return NULL;
+}
+
+static void *bench_mpmc_consumer_pthread(void *arg)
+{
+    bench_mpmc_consumer_body((struct bench_mpmc_ctx *)arg);
+    return NULL;
 }
 #endif
+
+static void bench_print_throughput(const char *label, uint64_t total_ops, int rounds,
+                                   const double *sec_per_round);
+
+static void bench_mpmc_throughput(volatile uintptr_t *sink)
+{
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    double sec[BENCH_MAX_ROUNDS];
+    struct bench_mpmc_ctx ctx[4];
+    static volatile long producers_done;
+    const int per_producer = 2000;
+    const int mpmc_rounds = 5;
+    const uint64_t total_ops = (uint64_t)(per_producer * 2);
+    const uint64_t bench_slots = total_ops + 64U;
+    int r;
+    uint32_t i;
+#if defined(_WIN32)
+    HANDLE threads[4];
+#else
+    pthread_t threads[4];
+#endif
+
+    printf("\n=== MPMC throughput bench (%d rounds, 4 threads, %llu msgs) ===\n",
+           mpmc_rounds, (unsigned long long)total_ops);
+
+    for (r = 0; r < mpmc_rounds; ++r) {
+        double t0;
+        double t1;
+
+        remove_test_file("bench_mpmc.endf");
+        err = ef_open_ex("bench_mpmc.endf", bench_slots, &db);
+        if (err != EF_OK || db == NULL) {
+            fprintf(stderr, "mpmc bench: open failed\n");
+            return;
+        }
+
+        producers_done = 0;
+        t0 = now_seconds();
+        for (i = 0; i < 4; ++i) {
+            ctx[i].db = db;
+            ctx[i].tid = (int)i;
+            ctx[i].count = (i < 2) ? per_producer : 0;
+            ctx[i].received = NULL;
+            ctx[i].done = &producers_done;
+#if defined(_WIN32)
+            threads[i] = (HANDLE)_beginthreadex(NULL, 0,
+                                                  (i < 2) ? bench_mpmc_producer_win : bench_mpmc_consumer_win,
+                                                  &ctx[i], 0, NULL);
+            if (threads[i] == NULL) {
+                fprintf(stderr, "mpmc bench: thread create failed\n");
+                ef_close(db);
+                db = NULL;
+                remove_test_file("bench_mpmc.endf");
+                return;
+            }
+#else
+            if (pthread_create(&threads[i], NULL,
+                               (i < 2) ? bench_mpmc_producer_pthread : bench_mpmc_consumer_pthread,
+                               &ctx[i]) != 0) {
+                fprintf(stderr, "mpmc bench: thread create failed\n");
+                ef_close(db);
+                db = NULL;
+                remove_test_file("bench_mpmc.endf");
+                return;
+            }
+#endif
+        }
+#if defined(_WIN32)
+        if (!mpmc_join_threads_win32(threads, 4, 120000, "bench_mpmc_throughput")) {
+            for (i = 0; i < 4; ++i) {
+                if (threads[i] != NULL) {
+                    CloseHandle(threads[i]);
+                }
+            }
+            ef_close(db);
+            db = NULL;
+            remove_test_file("bench_mpmc.endf");
+            return;
+        }
+        for (i = 0; i < 4; ++i) {
+            if (threads[i] != NULL) {
+                CloseHandle(threads[i]);
+                threads[i] = NULL;
+            }
+        }
+#else
+        if (!mpmc_join_threads_pthread(threads, 4, "bench_mpmc_throughput")) {
+            ef_close(db);
+            db = NULL;
+            remove_test_file("bench_mpmc.endf");
+            return;
+        }
+#endif
+        t1 = now_seconds();
+        sec[r] = t1 - t0;
+        if (sec[r] <= 0.0) {
+            sec[r] = 1e-9;
+        }
+        *sink ^= (uintptr_t)ef_queue_empty(db);
+        (void)ef_db_commit_meta(db);
+        ef_close(db);
+        db = NULL;
+        remove_test_file("bench_mpmc.endf");
+    }
+
+    bench_print_throughput("queue MPMC push+pop total", total_ops, mpmc_rounds, sec);
+}
+
+#endif /* EF_RUN_BENCH_MPMC */
+
+#else /* !EF_HAS_FILE_IO */
+
+static void test_queue_mpmc(void)
+{
+    printf("\n=== v3: MPMC queue (skipped, no file I/O) ===\n");
+}
+
+#endif /* EF_HAS_FILE_IO */
 
 static void test_sync(struct ef_db *db)
 {
@@ -1491,10 +1770,6 @@ static void test_sync(struct ef_db *db)
     err = ef_sync(db);
     expect_err(err, EF_OK, "ef_sync");
 }
-
-#define BENCH_ROUNDS 15
-#define BENCH_MAX_ROUNDS 32
-#define EF_RUN_BENCH_MPMC 1
 
 static void bench_sort_doubles(double *v, int n)
 {
@@ -1763,137 +2038,6 @@ static void run_hash_perf_suite(volatile uintptr_t *sink)
     bench_print_stats("ef_index_rehash 256->512 (fresh db)", 1, BENCH_ROUNDS, samples);
 }
 
-#if EF_RUN_BENCH_MPMC && defined(_WIN32) && EF_HAS_FILE_IO
-
-struct bench_mpmc_ctx {
-    struct ef_db *db;
-    int tid;
-    int count;
-    volatile long *received;
-    volatile long *done;
-};
-
-static unsigned __stdcall bench_mpmc_producer(void *arg)
-{
-    struct bench_mpmc_ctx *ctx = (struct bench_mpmc_ctx *)arg;
-    uint8_t payload[5];
-    int i;
-
-    for (i = 0; i < ctx->count; ++i) {
-        uint32_t id = (uint32_t)(ctx->tid * 100000 + (uint32_t)i);
-        enum ef_err err;
-        memcpy(payload, &id, sizeof(id));
-        do {
-            err = ef_queue_push(ctx->db, payload, 4);
-        } while (err != EF_OK);
-    }
-    InterlockedIncrement(ctx->done);
-    return 0;
-}
-
-static unsigned __stdcall bench_mpmc_consumer(void *arg)
-{
-    struct bench_mpmc_ctx *ctx = (struct bench_mpmc_ctx *)arg;
-    uint8_t buf[8];
-    size_t len;
-
-    for (;;) {
-        enum ef_err err = ef_queue_pop(ctx->db, buf, sizeof(buf), &len);
-        if (err == EF_ERR_QUEUE_EMPTY || err == EF_ERR_NOT_FOUND) {
-            if (mpmc_consumer_should_exit(ctx->db, ctx->done, 2)) {
-                break;
-            }
-            continue;
-        }
-        if (err == EF_ERR_QUEUE_BUSY) {
-            continue;
-        }
-        (void)len;
-    }
-    return 0;
-}
-
-static void bench_mpmc_throughput(volatile uintptr_t *sink)
-{
-    struct ef_db *db = NULL;
-    enum ef_err err;
-    double sec[BENCH_MAX_ROUNDS];
-    HANDLE threads[4];
-    struct bench_mpmc_ctx ctx[4];
-    static volatile long producers_done;
-    const int per_producer = 2000;
-    const int mpmc_rounds = 5;
-    const uint64_t total_ops = (uint64_t)(per_producer * 2);
-    const uint64_t bench_slots = total_ops + 64U;
-    int r;
-    uint32_t i;
-
-    printf("\n=== MPMC throughput bench (%d rounds, 4 threads, %llu msgs) ===\n",
-           mpmc_rounds, (unsigned long long)total_ops);
-
-    for (r = 0; r < mpmc_rounds; ++r) {
-        double t0;
-        double t1;
-
-        remove_test_file("bench_mpmc.endf");
-        err = ef_open_ex("bench_mpmc.endf", bench_slots, &db);
-        if (err != EF_OK || db == NULL) {
-            fprintf(stderr, "mpmc bench: open failed\n");
-            return;
-        }
-
-        producers_done = 0;
-        t0 = now_seconds();
-        for (i = 0; i < 4; ++i) {
-            ctx[i].db = db;
-            ctx[i].tid = (int)i;
-            ctx[i].count = (i < 2) ? per_producer : 0;
-            ctx[i].received = NULL;
-            ctx[i].done = &producers_done;
-            threads[i] = (HANDLE)_beginthreadex(NULL, 0,
-                                                (i < 2) ? bench_mpmc_producer : bench_mpmc_consumer,
-                                                &ctx[i], 0, NULL);
-            if (threads[i] == NULL) {
-                fprintf(stderr, "mpmc bench: thread create failed\n");
-                ef_close(db);
-                db = NULL;
-                remove_test_file("bench_mpmc.endf");
-                return;
-            }
-        }
-        if (!win32_join_threads(threads, 4, 120000, "bench_mpmc_throughput")) {
-            for (i = 0; i < 4; ++i) {
-                if (threads[i] != NULL) {
-                    CloseHandle(threads[i]);
-                }
-            }
-            ef_close(db);
-            db = NULL;
-            remove_test_file("bench_mpmc.endf");
-            return;
-        }
-        t1 = now_seconds();
-        for (i = 0; i < 4; ++i) {
-            if (threads[i] != NULL) {
-                CloseHandle(threads[i]);
-                threads[i] = NULL;
-            }
-        }
-        sec[r] = t1 - t0;
-        if (sec[r] <= 0.0) {
-            sec[r] = 1e-9;
-        }
-        *sink ^= (uintptr_t)ef_queue_empty(db);
-        (void)ef_db_commit_meta(db);
-        ef_close(db);
-        db = NULL;
-        remove_test_file("bench_mpmc.endf");
-    }
-
-    bench_print_throughput("queue MPMC push+pop total", total_ops, mpmc_rounds, sec);
-}
-#endif
-
 static void run_perf_suite(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
@@ -2065,7 +2209,7 @@ static void run_perf_suite(struct ef_db *db)
     bench_print_stats("ef_db_commit_meta (batch after 20k allocs)", 1, BENCH_ROUNDS, samples);
 
     run_hash_perf_suite(&sink);
-#if EF_RUN_BENCH_MPMC && defined(_WIN32) && EF_HAS_FILE_IO
+#if EF_RUN_BENCH_MPMC && EF_HAS_FILE_IO
     bench_mpmc_throughput(&sink);
 #endif
 

@@ -60,6 +60,10 @@ endfields_apply_target_options(endfields_embedded)
 
 add_executable(endfields_test src/main.c)
 target_link_libraries(endfields_test PRIVATE endfields)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(endfields_test PRIVATE Threads::Threads)
+endif()
 
 add_executable(endfields_embedded_test src/main_embedded.c)
 target_link_libraries(endfields_embedded_test PRIVATE endfields_embedded)

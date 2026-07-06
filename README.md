@@ -31,6 +31,7 @@ endfields-db/
 ├── CMakeLists.txt
 ├── LICENSE
 ├── README.md
+├── THREADING.md                    # 并发与跨进程语义
 └── src/
     ├── endfields.h / endfields.c   # 核心 API
     ├── ef_config.h                   # 编译选项与 schema 版本
@@ -73,13 +74,15 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 
 内存后端 `ef_grow` 在 `map_capacity` 范围内扩展 `file_size`；`ef_open_memory` 重开时会按超级块中的 `max_slots` 自动识别已扩容大小。
 
+多线程与跨进程语义见 **[THREADING.md](THREADING.md)**（队列 MPMC、空闲链 CAS、索引/槽位单写者约定）。
+
 ## 测试覆盖
 
 - `test_grow_memory` — 拒绝非法扩容、4→8→16 扩容、数据保留、重开识别
 - `test_slot_header_crc_*` — 头 CRC / 溢出槽 CRC 篡改、`ef_foreach_used` / `ef_slot_iter` 中止、磁盘篡改后只读打开拒绝
 - `test_v3_alloc_queue_index` — 尾部 grow 分配、FIFO 队列往返、Robin Hood 索引 put/get/remove、队列持久化重开
 - `test_index_lifecycle_and_rehash` — 索引 put → rehash 16→32 → free 后 get 应 NOT_FOUND
-- `test_queue_mpmc` — Windows 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次；消费者用 `ef_queue_drained` 在锁下确认排空后退出
+- `test_queue_mpmc` — 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次；Windows 用 Win32 线程，POSIX 用 **pthread**；消费者用 `ef_queue_drained` 在锁下确认排空后退出
 
 性能套件（`main.c`）另含 **MPMC 吞吐 bench**（5 轮 × 4 线程 × 4000 消息），槽位池按 `消息数 + 64` 预分配以避免高并发下槽位耗尽。
 
