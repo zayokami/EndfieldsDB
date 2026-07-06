@@ -1902,10 +1902,10 @@ static void test_index_mrsr(void)
     err = ef_open_memory_hash(arena, sizeof(arena), 128, 64, 1, &db);
     expect_err(err, EF_OK, "mrsr open");
     expect_true(db != NULL, "mrsr db");
-    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "mrsr schema v4");
     if (db == NULL) {
         return;
     }
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "mrsr schema v4");
 
     ef_index_mrsr_seed_keys(db);
 

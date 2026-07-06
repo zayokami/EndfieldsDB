@@ -69,8 +69,13 @@ static void ef_queue_yield(uint32_t spins)
 static void ef_set_error(struct ef_db *db, enum ef_err err)
 {
     if (db != NULL) {
-        atomic_store_explicit(&db->last_err, (uint32_t)err, memory_order_relaxed);
+        ef_atomic_store_u32(&db->last_err, (uint32_t)err);
     }
+}
+
+static void ef_slot_status_store(struct ef_slot *slot, uint32_t status)
+{
+    ef_atomic_store_u32(&slot->status, status);
 }
 
 static uint32_t ef_sb_free_count_load(const struct ef_superblock *sb)
@@ -142,7 +147,7 @@ void ef_db_mark_meta_dirty(struct ef_db *db)
         return;
     }
     if (db->sb->flags & EF_FLAG_SB_CRC) {
-        atomic_store_explicit(&db->sb_meta_dirty, (uint8_t)1, memory_order_relaxed);
+        ef_atomic_store_u8(&db->sb_meta_dirty, 1U);
     }
 }
 
@@ -155,9 +160,9 @@ enum ef_err ef_db_commit_meta(struct ef_db *db)
         ef_set_error(db, EF_OK);
         return EF_OK;
     }
-    if (atomic_load_explicit(&db->sb_meta_dirty, memory_order_relaxed)) {
+    if (ef_atomic_load_u8(&db->sb_meta_dirty) != 0U) {
         ef_sb_checksum_store(db->sb);
-        atomic_store_explicit(&db->sb_meta_dirty, (uint8_t)0, memory_order_relaxed);
+        ef_atomic_store_u8(&db->sb_meta_dirty, 0U);
     }
     ef_set_error(db, EF_OK);
     return EF_OK;
@@ -253,7 +258,7 @@ static enum ef_err ef_free_list_pop_atomic(struct ef_db *db, uint64_t *slot_id_o
         exp = head;
         if (EF_ATOMIC_CAS_U64(head_ptr, &exp, next)) {
             ef_slot_next_offset_store(slot, 0);
-            slot->status = EF_STATUS_USED;
+            ef_slot_status_store(slot, EF_STATUS_USED);
             memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
             ef_sb_free_count_dec(db->sb);
             ef_slot_header_crc_store(db, slot_id, slot);
@@ -286,11 +291,11 @@ static enum ef_err ef_free_list_push_atomic(struct ef_db *db, uint64_t slot_id, 
 
         head = EF_ATOMIC_LOAD_U64(head_ptr);
         ef_slot_next_offset_store(slot, head);
+        ef_slot_status_store(slot, EF_STATUS_FREE);
         EF_ATOMIC_THREAD_FENCE();
 
         exp = head;
         if (EF_ATOMIC_CAS_U64(head_ptr, &exp, slot_offset)) {
-            slot->status = EF_STATUS_FREE;
             ef_sb_free_count_inc(db->sb);
             ef_db_mark_meta_dirty(db);
             ef_set_error(db, EF_OK);
@@ -758,7 +763,7 @@ enum ef_err ef_last_error(const struct ef_db *db)
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    return (enum ef_err)atomic_load_explicit(&db->last_err, memory_order_relaxed);
+    return (enum ef_err)ef_atomic_load_u32(&db->last_err);
 }
 
 #if EF_HAS_FILE_IO

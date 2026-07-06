@@ -348,6 +348,34 @@ static inline uint32_t ef_atomic_fetch_sub_u32(volatile void *ptr, uint32_t delt
 {
     return ef_atomic_fetch_add_u32(ptr, (uint32_t)(0U - delta));
 }
+
+static inline uint8_t ef_atomic_load_u8(const volatile void *ptr)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    const volatile void *word_ptr = (const volatile void *)(addr - align_off);
+    uint32_t word = ef_atomic_load_u32(word_ptr);
+
+    return (uint8_t)((word >> (align_off * 8U)) & 0xFFU);
+}
+
+static inline void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t align_off = addr & (uintptr_t)3U;
+    volatile void *word_ptr = (volatile void *)(addr - align_off);
+    uint32_t exp_word;
+    uint32_t des_word;
+
+    exp_word = ef_atomic_load_u32((const void *)word_ptr);
+    for (;;) {
+        des_word = (exp_word & ~((uint32_t)0xFFU << (align_off * 8U))) |
+                   ((uint32_t)value << (align_off * 8U));
+        if (ef_atomic_cas_u32(word_ptr, &exp_word, des_word)) {
+            return;
+        }
+    }
+}
 #endif
 
 #endif /* EF_ATOMIC_UNALIGNED_H */
