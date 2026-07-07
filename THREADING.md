@@ -138,4 +138,3 @@ for (;;) {
 
 - 槽位读侧与索引读的原子组合 API
 - `ef_execute` 队列/索引操作码
-- 自动 `ef_index_rehash` 阈值

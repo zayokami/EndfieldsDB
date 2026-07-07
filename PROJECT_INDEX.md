@@ -115,7 +115,7 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 | `[23]` | index write lock u8 |
 | `[24..27]` | index seq u32 |
 
-注意: README 中部分表格仍以 v3 描述为主；并发与 v4 细节以 `THREADING.md` 和源码为准。
+注意: README、THREADING.md 与本索引均已同步到 schema v4；判断行为事实时仍优先读 `src/*.h` 和实现。
 
 ## 子系统地图
 
@@ -233,7 +233,7 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 
 ## 接手建议
 
-1. 判断行为事实时优先读 `src/*.h` 和实现，其次读 `THREADING.md`；README 对 schema v4 的描述可能滞后。
+1. 判断行为事实时优先读 `src/*.h` 和实现，其次读 `THREADING.md`、README 与本索引。
 2. 修改索引或队列前先确认 `reserved[28]` 布局，不要直接硬编码偏移，优先用 `ef_sb_layout.*` helper。
 3. 修改 rehash 时必须同时考虑槽区搬迁、free list、queue head/tail、槽内 `next_offset` 和哈希项 slot offset。
 4. 修改队列出队或释放路径时注意索引删除和归还空闲链的顺序。
