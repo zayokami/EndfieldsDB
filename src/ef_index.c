@@ -17,6 +17,10 @@
 
 #define EF_SB_SIZE 64U
 
+static uint32_t ef_index_pick_capacity(uint32_t entries);
+static enum ef_err ef_index_rehash_target_for_insert(struct ef_db *db, uint64_t key_hash,
+                                                     uint32_t *target_out);
+
 static int ef_hash_entry_empty_atomic(const struct ef_hash_entry *entry)
 {
     return ef_atomic_load_u64((const void *)&entry->slot_offset) == 0ULL;
@@ -327,6 +331,7 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     uint64_t key_hash;
     uint64_t slot_offset;
     enum ef_err err;
+    uint32_t retries = 0;
 
     if (db == NULL || key == NULL) {
         return EF_ERR_NULL_ARG;
@@ -343,17 +348,51 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
         return EF_ERR_SLOT_ID;
     }
 
-    err = ef_index_write_begin(db);
-    if (err != EF_OK) {
+    for (;;) {
+        uint32_t rehash_target = 0;
+
+        err = ef_index_write_begin(db);
+        if (err != EF_OK) {
+            return err;
+        }
+
+        err = ef_index_rehash_target_for_insert(db, key_hash, &rehash_target);
+        if (err == EF_OK && rehash_target == 0U) {
+            slot_offset = ef_slot_to_offset(db, slot_id);
+            if (slot_offset == 0) {
+                err = EF_ERR_SLOT_ID;
+            } else {
+                err = ef_index_put_entry(db, key_hash, slot_offset);
+            }
+            if (err == EF_ERR_INDEX_FULL) {
+                rehash_target = ef_index_pick_capacity(ef_index_count_entries(db) + 1U);
+                if (rehash_target == 0U || rehash_target <= db->hash_capacity) {
+                    rehash_target = 0U;
+                } else {
+                    err = EF_OK;
+                }
+            }
+        }
+
+        ef_index_write_end(db);
+
+        if (err != EF_OK) {
+            return err;
+        }
+        if (rehash_target == 0U) {
+            ef_db_mark_meta_dirty(db);
+            return EF_OK;
+        }
+
+        err = ef_index_rehash(db, rehash_target);
+        if (err == EF_OK) {
+            continue;
+        }
+        if (err == EF_ERR_GROW && ++retries < EF_SB_INDEX_SEQ_READ_MAX) {
+            continue;
+        }
         return err;
     }
-
-    err = ef_index_put_entry(db, key_hash, slot_offset);
-    ef_index_write_end(db);
-    if (err == EF_OK) {
-        ef_db_mark_meta_dirty(db);
-    }
-    return err;
 }
 
 enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_out)
@@ -543,7 +582,7 @@ enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
     if (new_capacity <= old_capacity || (new_capacity & (new_capacity - 1U)) != 0) {
         return EF_ERR_GROW;
     }
-    if (new_capacity > 0xFFFFU) {
+    if (new_capacity > EF_INDEX_MAX_CAPACITY) {
         return EF_ERR_GROW;
     }
 
@@ -659,5 +698,94 @@ enum ef_err ef_index_clear(struct ef_db *db)
     memset(db->hash_index, 0, (size_t)db->hash_capacity * sizeof(struct ef_hash_entry));
     ef_db_mark_meta_dirty(db);
     ef_index_write_end(db);
+    return EF_OK;
+}
+
+uint32_t ef_index_capacity(const struct ef_db *db)
+{
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+        return 0U;
+    }
+    return db->hash_capacity;
+}
+
+uint32_t ef_index_count_entries(const struct ef_db *db)
+{
+    uint32_t count = 0U;
+    uint32_t i;
+
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+        return 0U;
+    }
+
+    for (i = 0; i < db->hash_capacity; ++i) {
+        if (!ef_hash_entry_empty(db->hash_index + i)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static int ef_index_load_exceeded(uint32_t entries, uint32_t capacity)
+{
+    return (uint64_t)entries * EF_INDEX_REHASH_LOAD_FACTOR_DEN >
+           (uint64_t)capacity * EF_INDEX_REHASH_LOAD_FACTOR_NUM;
+}
+
+/* Choose the smallest power-of-two capacity that keeps entries at or below the
+ * rehash threshold. Returns 0 when no valid capacity can satisfy the threshold. */
+static uint32_t ef_index_pick_capacity(uint32_t entries)
+{
+    uint32_t cap = EF_DEFAULT_HASH_MIN;
+
+    if (entries == 0U) {
+        return cap;
+    }
+
+    while (ef_index_load_exceeded(entries, cap)) {
+        if (cap >= EF_INDEX_MAX_CAPACITY) {
+            return 0U;
+        }
+        cap <<= 1U;
+    }
+
+    return cap;
+}
+
+static enum ef_err ef_index_rehash_target_for_insert(struct ef_db *db, uint64_t key_hash,
+                                                     uint32_t *target_out)
+{
+    struct ef_hash_entry found;
+    enum ef_err err;
+    uint32_t entries_after;
+
+    if (target_out == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    *target_out = 0U;
+
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+        return EF_ERR_NULL_ARG;
+    }
+
+    err = ef_index_find_entry_unlocked(db, key_hash, &found);
+    if (err == EF_OK) {
+        return EF_OK;
+    }
+    if (err != EF_ERR_NOT_FOUND) {
+        return err;
+    }
+
+    entries_after = ef_index_count_entries(db) + 1U;
+    if (!ef_index_load_exceeded(entries_after, db->hash_capacity)) {
+        return EF_OK;
+    }
+
+    *target_out = ef_index_pick_capacity(entries_after);
+    if (*target_out == 0U || *target_out <= db->hash_capacity) {
+        *target_out = 0U;
+        return EF_ERR_INDEX_FULL;
+    }
+
     return EF_OK;
 }

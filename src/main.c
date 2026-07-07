@@ -1393,6 +1393,162 @@ static void test_index_lifecycle_and_rehash(void)
     ef_close(db);
 }
 
+static void test_index_auto_rehash(void)
+{
+    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64];
+    static alignas(64) uint8_t tight_arena[64 + 16 * 16 + 32 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slots[48];
+    uint64_t slot_id = 0;
+    uint64_t update_slot = 0;
+    uint64_t looked = 0;
+    uint32_t i;
+    char key[24];
+
+    printf("\n=== v4: index auto rehash on load threshold ===\n");
+
+    memset(slots, 0, sizeof(slots));
+    err = ef_open_memory_hash(arena, sizeof(arena), 128, 16, 1, &db);
+    expect_err(err, EF_OK, "open tiny index for auto rehash");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(ef_index_capacity(db) == 16, "initial capacity 16");
+
+    for (i = 0; i < 12; ++i) {
+        snprintf(key, sizeof(key), "auto-%03u", i);
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "alloc before threshold");
+        err = ef_write_payload(db, slots[i], key, (uint8_t)strlen(key));
+        expect_err(err, EF_OK, "write before threshold");
+        err = ef_index_put(db, key, slots[i]);
+        expect_err(err, EF_OK, "put before threshold");
+    }
+    expect_true(ef_index_capacity(db) == 16, "12/16 load stays at capacity 16");
+    expect_true(ef_index_count_entries(db) == 12, "12 indexed entries before threshold");
+
+    err = ef_alloc(db, &update_slot);
+    expect_err(err, EF_OK, "alloc replacement slot");
+    err = ef_write_payload(db, update_slot, "updated", 7);
+    expect_err(err, EF_OK, "write replacement slot");
+    err = ef_index_put(db, "auto-000", update_slot);
+    expect_err(err, EF_OK, "updating existing key does not rehash");
+    expect_true(ef_index_capacity(db) == 16, "update at threshold keeps capacity 16");
+    expect_true(ef_index_count_entries(db) == 12, "update at threshold keeps entry count");
+    err = ef_index_get(db, "auto-000", &looked);
+    expect_err(err, EF_OK, "lookup updated key");
+    expect_true(looked == update_slot, "updated key points at replacement slot");
+    slots[0] = update_slot;
+
+    snprintf(key, sizeof(key), "auto-%03u", 12U);
+    err = ef_alloc(db, &slots[12]);
+    expect_err(err, EF_OK, "alloc threshold crossing entry");
+    err = ef_write_payload(db, slots[12], key, (uint8_t)strlen(key));
+    expect_err(err, EF_OK, "write threshold crossing entry");
+    err = ef_index_put(db, key, slots[12]);
+    expect_err(err, EF_OK, "13th insert auto rehashes");
+    expect_true(ef_index_capacity(db) == 32, "13/16 load grows to 32");
+    expect_true(ef_index_count_entries(db) == 13, "13 indexed entries after first auto rehash");
+
+    for (i = 13; i < 48; ++i) {
+        snprintf(key, sizeof(key), "auto-%03u", i);
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "alloc after first auto rehash");
+        err = ef_write_payload(db, slots[i], key, (uint8_t)strlen(key));
+        expect_err(err, EF_OK, "write after first auto rehash");
+        err = ef_index_put(db, key, slots[i]);
+        expect_err(err, EF_OK, "put after first auto rehash");
+    }
+
+    expect_true(ef_index_capacity(db) == 64, "25th insert grows 32->64 and 48/64 stays put");
+    expect_true(ef_index_count_entries(db) == 48, "48 indexed entries after auto rehash");
+
+    for (i = 0; i < 48; ++i) {
+        snprintf(key, sizeof(key), "auto-%03u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "lookup after auto rehash");
+        if (looked != slots[i]) {
+            char msg[128];
+
+            snprintf(msg, sizeof(msg), "lookup %s returned slot %llu, want %llu",
+                     key, (unsigned long long)looked, (unsigned long long)slots[i]);
+            expect_true(0, msg);
+        }
+        expect_true(ef_get_slot(db, looked) != NULL, "slot reachable after auto rehash");
+    }
+
+    ef_close(db);
+
+    db = NULL;
+    err = ef_open_memory_hash(tight_arena, sizeof(tight_arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "open tight arena for failed auto rehash");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 12; ++i) {
+        snprintf(key, sizeof(key), "tight-%03u", i);
+        err = ef_alloc(db, &slot_id);
+        expect_err(err, EF_OK, "tight alloc before threshold");
+        err = ef_index_put(db, key, slot_id);
+        expect_err(err, EF_OK, "tight put before threshold");
+    }
+    expect_true(ef_index_capacity(db) == 16, "tight arena starts at capacity 16");
+    expect_true(ef_index_count_entries(db) == 12, "tight arena has threshold entries");
+
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "tight alloc crossing entry");
+    err = ef_index_put(db, "tight-012", slot_id);
+    expect_err(err, EF_ERR_FILE_SIZE, "auto rehash fails when memory map cannot grow");
+    expect_true(ef_index_capacity(db) == 16, "failed auto rehash keeps old capacity");
+    expect_true(ef_index_count_entries(db) == 12, "failed auto rehash keeps old entries");
+    expect_err(ef_index_get(db, "tight-012", &looked), EF_ERR_NOT_FOUND,
+               "failed auto rehash does not insert new key");
+    for (i = 0; i < 12; ++i) {
+        snprintf(key, sizeof(key), "tight-%03u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "old key survives failed auto rehash");
+    }
+
+    ef_close(db);
+
+#if EF_HAS_FILE_IO
+    remove_test_file("test_index_auto.endf");
+    db = NULL;
+    err = ef_open_ex_hash("test_index_auto.endf", 64, 16, &db);
+    expect_err(err, EF_OK, "open file index for auto rehash");
+    if (db != NULL) {
+        for (i = 0; i < 25; ++i) {
+            snprintf(key, sizeof(key), "file-%03u", i);
+            err = ef_alloc(db, &slot_id);
+            expect_err(err, EF_OK, "file auto rehash alloc");
+            err = ef_index_put(db, key, slot_id);
+            expect_err(err, EF_OK, "file auto rehash put");
+        }
+        expect_true(ef_index_capacity(db) == 64, "file auto rehash grows to 64");
+        err = ef_sync(db);
+        expect_err(err, EF_OK, "sync file auto rehash db");
+        ef_close(db);
+
+        db = NULL;
+        err = ef_open_ex_hash("test_index_auto.endf", 64, 16, &db);
+        expect_err(err, EF_OK, "reopen file auto rehash db");
+        if (db != NULL) {
+            expect_true(ef_index_capacity(db) == 64, "reopened file keeps auto-grown capacity");
+            for (i = 0; i < 25; ++i) {
+                snprintf(key, sizeof(key), "file-%03u", i);
+                err = ef_index_get(db, key, &looked);
+                expect_err(err, EF_OK, "file lookup after auto rehash reopen");
+            }
+            ef_close(db);
+        }
+    }
+    remove_test_file("test_index_auto.endf");
+#endif
+}
+
 #ifdef ENDFIELDS_CI_FAST
 #define BENCH_ROUNDS 3
 #define BENCH_MPMC_ROUNDS 2
@@ -2415,7 +2571,7 @@ static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
 
 static void run_hash_perf_suite(volatile uintptr_t *sink)
 {
-    static alignas(64) uint8_t hash_arena[64 + 256 * 16 + 128 * 64];
+    static alignas(64) uint8_t hash_arena[64 + 1024 * 16 + 512 * 64];
     struct ef_db *db = NULL;
     double samples[BENCH_MAX_ROUNDS];
     double t0;
@@ -2426,6 +2582,7 @@ static void run_hash_perf_suite(volatile uintptr_t *sink)
     const int put_iters = 50000;
     const int get_iters = 200000;
     const int remove_iters = 20000;
+    const int auto_iters = 512;
     char key[32];
     uint64_t slot_id;
     uint64_t looked;
@@ -2525,6 +2682,36 @@ static void run_hash_perf_suite(volatile uintptr_t *sink)
         db = NULL;
     }
     bench_print_stats("ef_index_rehash 256->512 (fresh db)", 1, BENCH_ROUNDS, samples);
+
+    for (r = 0; r < BENCH_ROUNDS; ++r) {
+        int j;
+        uint32_t cap_before;
+
+        err = ef_open_memory_hash(hash_arena, sizeof(hash_arena), 512, 16, 1, &db);
+        if (err != EF_OK || db == NULL) {
+            break;
+        }
+        cap_before = ef_index_capacity(db);
+        t0 = now_seconds();
+        for (j = 0; j < auto_iters; ++j) {
+            snprintf(key, sizeof(key), "au-%d-%04d", r, j);
+            err = ef_alloc(db, &slot_id);
+            if (err != EF_OK) {
+                break;
+            }
+            err = ef_index_put(db, key, slot_id);
+            if (err != EF_OK) {
+                *sink ^= (uintptr_t)err;
+                break;
+            }
+        }
+        t1 = now_seconds();
+        samples[r] = (t1 - t0) * 1e9 / (double)j;
+        *sink ^= (uintptr_t)(db->hash_capacity != cap_before);
+        ef_close(db);
+        db = NULL;
+    }
+    bench_print_stats("ef_index_put + auto rehash (cap 16->grows)", auto_iters, BENCH_ROUNDS, samples);
 }
 
 static void run_perf_suite(struct ef_db *db)
@@ -2976,6 +3163,7 @@ int main(void)
     test_slot_header_crc_memory();
     test_v3_alloc_queue_index();
     test_index_lifecycle_and_rehash();
+    test_index_auto_rehash();
 #if EF_HAS_FILE_IO
     test_v3_to_v4_index_migration();
     test_index_mrsr();

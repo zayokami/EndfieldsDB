@@ -389,7 +389,7 @@ static int ef_hash_capacity_valid(uint32_t hash_capacity)
     if (hash_capacity == 0) {
         return 1;
     }
-    if (hash_capacity > 0xFFFFU) {
+    if (hash_capacity > EF_INDEX_MAX_CAPACITY) {
         return 0;
     }
     return (hash_capacity & (hash_capacity - 1U)) == 0;
