@@ -1,5 +1,5 @@
 # Build outputs
-/build/
+/build*/
 /out/
 /cmake-build-*/
 
@@ -47,3 +47,4 @@ Desktop.ini
 # Logs
 *.log
 test_out*.txt
+bench-out.txt

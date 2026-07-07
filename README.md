@@ -34,14 +34,19 @@ endfields-db/
 ├── LICENSE
 ├── README.md
 ├── THREADING.md                    # 并发与跨进程语义
-└── src/
-    ├── endfields.h / endfields.c   # 核心 API
-    ├── ef_config.h                   # 编译选项与 schema 版本
-    ├── ef_index.h / ef_index.c       # Robin Hood 字符串索引
-    ├── ef_port.h / ef_port.c         # 平台 I/O 抽象
-    ├── ef_crc.h / ef_crc.c           # CRC32
-    ├── main.c                        # 文件 + 内存综合测试
-    └── main_embedded.c               # 纯嵌入式测试
+├── src/
+│   ├── endfields.h / endfields.c   # 核心 API
+│   ├── ef_config.h                 # 编译选项与 schema 版本
+│   ├── ef_index.h / ef_index.c     # Robin Hood 字符串索引
+│   ├── ef_port.h / ef_port.c       # 平台 I/O 抽象
+│   ├── ef_crc.h / ef_crc.c         # CRC32
+│   └── main_embedded.c             # 纯嵌入式测试入口
+├── tests/
+│   ├── test_common.h / test_common.c
+│   ├── test_core.c                 # 核心、文件、内存、CRC、blob 测试
+│   └── test_index_queue.c          # 索引、队列、并发、迁移测试
+└── bench/
+    └── endfields_bench.c           # 性能与工程场景 bench
 ```
 
 ## 构建
@@ -94,7 +99,8 @@ ctest --test-dir build --output-on-failure
 
 - `libendfields.a` — 文件 + 内存后端
 - `libendfields_embedded.a` — 纯 RAM 后端（无文件 I/O）
-- `endfields_test` / `endfields_embedded_test` — 测试可执行文件
+- `endfields_core_test` / `endfields_index_queue_test` / `endfields_embedded_test` — 测试可执行文件
+- `endfields_bench` — 独立性能与工程场景 bench
 
 链接示例：
 
@@ -107,7 +113,7 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O；不构建 `endfields_test` |
+| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O；不构建 host 测试与 bench target |
 | `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
 | `ENDFIELDS_WARNINGS_AS_ERRORS` | OFF | `-Werror`（CI 开启） |
 | `ENDFIELDS_SANITIZE` | OFF | GCC/Clang：AddressSanitizer + UBSan |
@@ -130,7 +136,7 @@ target_include_directories(your_app PRIVATE path/to/endfields/src)
 - `test_index_mrsr` — 4 读者 + 1 写者验证 v4 索引 seqlock / 写锁并发语义
 - `test_queue_mpmc` — 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次；Windows 用 Win32 线程，POSIX 用 **pthread**；消费者用 `ef_queue_drained` 在锁下确认排空后退出
 
-性能套件（`main.c`）另含 **MPMC 吞吐 bench**（默认 5 轮，2 生产者 × 2000 条消息，CI 快速模式降为 2 轮 × 500 条/生产者），以及哈希 put/get/remove、手动 rehash、自动 rehash bench。槽位池按 `消息数 + 64` 预分配以避免高并发下槽位耗尽。
+性能套件（`bench/endfields_bench.c`，CTest 名称 `endfields_bench`）另含 **MPMC 吞吐 bench**（默认 5 轮，2 生产者 × 2000 条消息，CI 快速模式降为 2 轮 × 500 条/生产者），以及哈希 put/get/remove、手动 rehash、自动 rehash bench。槽位池按 `消息数 + 64` 预分配以避免高并发下槽位耗尽。
 
 ## 快速示例
 
