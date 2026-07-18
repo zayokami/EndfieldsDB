@@ -34,10 +34,13 @@ _gcc_test.c
 # IDE & editor
 .vs/
 .vscode/
+.claude/
+.agents/
 .idea/
 *.swp
 *.swo
 *~
+CLAUDE.MD
 
 # OS
 .DS_Store
