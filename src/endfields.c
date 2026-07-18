@@ -600,7 +600,6 @@ static void ef_init_slots(struct ef_db *db)
     memset(db->slots, 0, slots_bytes);
 }
 
-static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id);
 static struct ef_slot *ef_slot_at_offset(struct ef_db *db, uint64_t offset, uint64_t *slot_id_out);
 
 static enum ef_err ef_build_free_list(struct ef_db *db)
@@ -716,39 +715,6 @@ static enum ef_err ef_db_init_mapped(struct ef_db *db, int is_new_file, uint64_t
     return EF_OK;
 }
 
-static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id);
-
-static enum ef_err ef_claim_slot(struct ef_db *db, uint64_t slot_id)
-{
-    struct ef_slot *slot;
-    enum ef_err err;
-
-    slot = ef_peek_slot(db, slot_id);
-    if (slot == NULL) {
-        ef_set_error(db, EF_ERR_SLOT_ID);
-        return EF_ERR_SLOT_ID;
-    }
-
-    if (slot->status == EF_STATUS_USED) {
-        ef_set_error(db, EF_OK);
-        return EF_OK;
-    }
-
-    err = ef_unlink_free_slot(db, slot_id);
-    if (err != EF_OK) {
-        ef_set_error(db, err);
-        return err;
-    }
-
-    slot->status = EF_STATUS_USED;
-    if (ef_sb_free_count_load(db->sb) > 0) {
-        ef_sb_free_count_dec(db->sb);
-    }
-    ef_slot_header_crc_store(db, slot_id, slot);
-    ef_db_mark_meta_dirty(db);
-    ef_set_error(db, EF_OK);
-    return EF_OK;
-}
 
 const char *ef_strerror(enum ef_err err)
 {
@@ -1284,14 +1250,8 @@ enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, 
         return ef_last_error(db);
     }
     if (head->status == EF_STATUS_FREE) {
-        err = ef_claim_slot(db, slot_id);
-        if (err != EF_OK) {
-            return err;
-        }
-        head = ef_get_slot(db, slot_id);
-        if (head == NULL) {
-            return ef_last_error(db);
-        }
+        ef_set_error(db, EF_ERR_SLOT_FREE);
+        return EF_ERR_SLOT_FREE;
     }
     if (head->status != EF_STATUS_USED) {
         ef_set_error(db, EF_ERR_SLOT_BUSY);
@@ -1934,44 +1894,6 @@ void *ef_get_field_ptr(struct ef_slot *slot, uint8_t field_offset)
     return (uint8_t *)slot + field_offset;
 }
 
-static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id)
-{
-    struct ef_slot *slot;
-    struct ef_slot *cursor;
-    uint64_t slot_offset;
-    uint64_t guard;
-    uint64_t max_guard;
-
-    slot = ef_peek_slot(db, slot_id);
-    if (slot == NULL) {
-        return EF_ERR_SLOT_ID;
-    }
-    if (slot->status != EF_STATUS_FREE) {
-        return EF_OK;
-    }
-
-    slot_offset = ef_slot_to_offset(db, slot_id);
-    if (db->sb->free_list_head == slot_offset) {
-        db->sb->free_list_head = slot->next_offset;
-        slot->next_offset = 0;
-        return EF_OK;
-    }
-
-    cursor = ef_slot_at_offset(db, db->sb->free_list_head, NULL);
-    max_guard = db->sb->max_slots + 1U;
-    guard = 0;
-    while (cursor != NULL && guard < max_guard) {
-        ++guard;
-        if (cursor->next_offset == slot_offset) {
-            cursor->next_offset = slot->next_offset;
-            slot->next_offset = 0;
-            return EF_OK;
-        }
-        cursor = ef_slot_at_offset(db, cursor->next_offset, NULL);
-    }
-
-    return EF_ERR_NOT_FOUND;
-}
 
 enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
 {
@@ -1999,7 +1921,8 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
 
     if (status == EF_STATUS_USED) {
         if (slot->status == EF_STATUS_FREE) {
-            return ef_claim_slot(db, slot_id);
+            ef_set_error(db, EF_ERR_SLOT_FREE);
+            return EF_ERR_SLOT_FREE;
         }
         if (slot->status == EF_STATUS_USED) {
             ef_set_error(db, EF_OK);
@@ -2089,11 +2012,8 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
     }
 
     if (slot->status == EF_STATUS_FREE) {
-        err = ef_claim_slot(db, slot_id);
-        if (err != EF_OK) {
-            return err;
-        }
-        slot = ef_peek_slot(db, slot_id);
+        ef_set_error(db, EF_ERR_SLOT_FREE);
+        return EF_ERR_SLOT_FREE;
     } else if (ef_slot_status_has_crc(slot->status)) {
         if (!ef_slot_header_crc_valid(db, slot_id, slot)) {
             ef_set_error(db, EF_ERR_BAD_CHECKSUM);

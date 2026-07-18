@@ -24,20 +24,24 @@ static void test_write_read_api(struct ef_db *db)
 {
     const char *text = "Hello Endfields";
     struct ef_slot *slot;
+    uint64_t slot_id = 0;
     enum ef_err err;
 
-    err = ef_write_payload(db, 3, text, (uint8_t)strlen(text));
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for ef_write_payload");
+
+    err = ef_write_payload(db, slot_id, text, (uint8_t)strlen(text));
     expect_err(err, EF_OK, "ef_write_payload");
 
-    slot = ef_get_slot(db, 3);
+    slot = ef_get_slot(db, slot_id);
     expect_true(slot != NULL, "ef_get_slot after write");
     expect_true(slot->status == EF_STATUS_USED, "status auto-set to USED");
     expect_true(strcmp(slot->payload, text) == 0, "payload content");
 
-    err = ef_write_payload(db, 3, NULL, 0);
+    err = ef_write_payload(db, slot_id, NULL, 0);
     expect_err(err, EF_OK, "ef_write_payload zero-length clears");
 
-    slot = ef_get_slot(db, 3);
+    slot = ef_get_slot(db, slot_id);
     expect_true(slot->payload[0] == '\0', "payload cleared");
 }
 
@@ -46,36 +50,44 @@ static void test_write_execute(struct ef_db *db)
     struct ef_cmd cmd;
     struct ef_slot *slot;
     const char *text = "Written via opcode";
+    uint64_t slot_w = 0;
+    uint64_t slot_s = 0;
     uint64_t next = ef_slot_to_offset(db, 7);
     uint32_t status = EF_STATUS_USED;
     uint8_t byte = 0xAB;
+    enum ef_err err;
+
+    err = ef_alloc(db, &slot_w);
+    expect_err(err, EF_OK, "alloc execute write slot");
+    err = ef_alloc(db, &slot_s);
+    expect_err(err, EF_OK, "alloc execute status slot");
 
     cmd.opcode = EF_OP_WRITE_PAYLOAD;
-    cmd.param = 5;
+    cmd.param = slot_w;
     cmd.field_offset = (uint8_t)strlen(text);
     slot = (struct ef_slot *)ef_execute(db, &cmd, text);
     expect_true(slot != NULL, "EF_OP_WRITE_PAYLOAD result");
     expect_true(strcmp(slot->payload, text) == 0, "EF_OP_WRITE_PAYLOAD content");
 
     cmd.opcode = EF_OP_SET_NEXT;
-    cmd.param = 5;
+    cmd.param = slot_w;
     cmd.field_offset = 0;
     slot = (struct ef_slot *)ef_execute(db, &cmd, &next);
     expect_true(slot != NULL, "EF_OP_SET_NEXT result");
     expect_true(slot->next_offset == next, "EF_OP_SET_NEXT value");
 
     cmd.opcode = EF_OP_SET_STATUS;
-    cmd.param = 8;
+    cmd.param = slot_s;
     cmd.field_offset = 0;
     slot = (struct ef_slot *)ef_execute(db, &cmd, &status);
     expect_true(slot != NULL, "EF_OP_SET_STATUS result");
     expect_true(slot->status == EF_STATUS_USED, "EF_OP_SET_STATUS value");
 
     cmd.opcode = EF_OP_WRITE_FIELD;
-    cmd.param = 8;
+    cmd.param = slot_s;
     cmd.field_offset = 8;
     expect_true(ef_execute(db, &cmd, &byte) != NULL, "EF_OP_WRITE_FIELD result");
-    slot = ef_get_slot(db, 8);
+    slot = ef_get_slot(db, slot_s);
     expect_true(slot != NULL && ((uint8_t *)ef_slot_payload_ptr(db, slot))[0] == 0xAB,
                 "EF_OP_WRITE_FIELD byte");
 }
@@ -86,47 +98,54 @@ static void test_execute_get_slot_and_field(struct ef_db *db)
     struct ef_slot *slot_via_get;
     struct ef_slot *slot_via_execute;
     struct ef_slot *slot;
+    uint64_t slots[4] = {0};
     uint64_t off_a;
     uint64_t off_b;
     uint64_t off_c;
     uint8_t byte = 0xCD;
     enum ef_err err;
+    int i;
 
-    err = ef_write_payload(db, 20, "execute", 7);
+    for (i = 0; i < 4; ++i) {
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "execute get_slot alloc");
+    }
+
+    err = ef_write_payload(db, slots[0], "execute", 7);
     expect_err(err, EF_OK, "execute setup payload");
 
-    slot_via_get = ef_get_slot(db, 20);
+    slot_via_get = ef_get_slot(db, slots[0]);
     cmd.opcode = EF_OP_GET_SLOT;
-    cmd.param = 20;
+    cmd.param = slots[0];
     cmd.field_offset = 0;
     slot_via_execute = (struct ef_slot *)ef_execute(db, &cmd, NULL);
     expect_true(slot_via_get != NULL && slot_via_execute == slot_via_get,
                 "EF_OP_GET_SLOT matches ef_get_slot");
 
     cmd.opcode = EF_OP_WRITE_FIELD;
-    cmd.param = 20;
+    cmd.param = slots[0];
     cmd.field_offset = 12;
     slot = (struct ef_slot *)ef_execute(db, &cmd, &byte);
     expect_true(slot != NULL, "EF_OP_WRITE_FIELD result");
     cmd.opcode = EF_OP_GET_FIELD;
-    cmd.param = 20;
+    cmd.param = slots[0];
     cmd.field_offset = 12;
     expect_true(ef_execute(db, &cmd, NULL) != NULL, "EF_OP_GET_FIELD result");
     expect_true(*(const uint8_t *)ef_execute(db, &cmd, NULL) == 0xCD,
                 "EF_OP_GET_FIELD reads back value");
 
-    err = ef_write_payload(db, 21, "A", 1);
+    err = ef_write_payload(db, slots[1], "A", 1);
     expect_err(err, EF_OK, "chase_n execute write A");
-    err = ef_write_payload(db, 22, "B", 1);
+    err = ef_write_payload(db, slots[2], "B", 1);
     expect_err(err, EF_OK, "chase_n execute write B");
-    err = ef_write_payload(db, 23, "C", 1);
+    err = ef_write_payload(db, slots[3], "C", 1);
     expect_err(err, EF_OK, "chase_n execute write C");
-    off_a = ef_slot_to_offset(db, 21);
-    off_b = ef_slot_to_offset(db, 22);
-    off_c = ef_slot_to_offset(db, 23);
-    err = ef_set_next_offset(db, 21, off_b);
+    off_a = ef_slot_to_offset(db, slots[1]);
+    off_b = ef_slot_to_offset(db, slots[2]);
+    off_c = ef_slot_to_offset(db, slots[3]);
+    err = ef_set_next_offset(db, slots[1], off_b);
     expect_err(err, EF_OK, "chase_n execute link A->B");
-    err = ef_set_next_offset(db, 22, off_c);
+    err = ef_set_next_offset(db, slots[2], off_c);
     expect_err(err, EF_OK, "chase_n execute link B->C");
 
     cmd.opcode = EF_OP_CHASE_N;
@@ -148,24 +167,31 @@ static void test_chase_loop(struct ef_db *db)
     struct ef_slot *slot0;
     struct ef_slot *slot50;
     struct ef_slot *chased;
+    uint64_t slot0_id = 0;
+    uint64_t slot50_id = 0;
     uint64_t slot0_offset;
     uint64_t slot50_offset;
     enum ef_err err;
 
-    slot0 = ef_get_slot(db, 0);
-    slot50 = ef_get_slot(db, 50);
+    err = ef_alloc(db, &slot0_id);
+    expect_err(err, EF_OK, "alloc chase slot0");
+    err = ef_alloc(db, &slot50_id);
+    expect_err(err, EF_OK, "alloc chase slot50");
+
+    slot0 = ef_get_slot(db, slot0_id);
+    slot50 = ef_get_slot(db, slot50_id);
     expect_true(slot0 != NULL && slot50 != NULL, "setup chase slots");
 
-    err = ef_write_payload(db, 0, "Root Node", 9);
+    err = ef_write_payload(db, slot0_id, "Root Node", 9);
     expect_err(err, EF_OK, "write slot0 payload");
 
-    slot0_offset = ef_slot_to_offset(db, 0);
-    slot50_offset = ef_slot_to_offset(db, 50);
+    slot0_offset = ef_slot_to_offset(db, slot0_id);
+    slot50_offset = ef_slot_to_offset(db, slot50_id);
 
-    err = ef_set_next_offset(db, 0, slot50_offset);
+    err = ef_set_next_offset(db, slot0_id, slot50_offset);
     expect_err(err, EF_OK, "set slot0 next");
 
-    err = ef_write_payload(db, 50, "Chased Target Node", 18);
+    err = ef_write_payload(db, slot50_id, "Chased Target Node", 18);
     expect_err(err, EF_OK, "write slot50 payload");
 
     chase_cmd.opcode = EF_OP_CHASE;
@@ -186,27 +212,34 @@ static void test_chase_n(struct ef_db *db)
 {
     struct ef_cmd cmd;
     struct ef_slot *slot;
+    uint64_t slots[3] = {0};
     uint64_t off_a;
     uint64_t off_b;
     uint64_t off_c;
     uint32_t hops = 0;
     uint32_t hops_param = 2;
     enum ef_err err;
+    int i;
 
-    err = ef_write_payload(db, 10, "A", 1);
+    for (i = 0; i < 3; ++i) {
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "chase_n alloc");
+    }
+
+    err = ef_write_payload(db, slots[0], "A", 1);
     expect_err(err, EF_OK, "chase_n write A");
-    err = ef_write_payload(db, 11, "B", 1);
+    err = ef_write_payload(db, slots[1], "B", 1);
     expect_err(err, EF_OK, "chase_n write B");
-    err = ef_write_payload(db, 12, "C", 1);
+    err = ef_write_payload(db, slots[2], "C", 1);
     expect_err(err, EF_OK, "chase_n write C");
 
-    off_a = ef_slot_to_offset(db, 10);
-    off_b = ef_slot_to_offset(db, 11);
-    off_c = ef_slot_to_offset(db, 12);
+    off_a = ef_slot_to_offset(db, slots[0]);
+    off_b = ef_slot_to_offset(db, slots[1]);
+    off_c = ef_slot_to_offset(db, slots[2]);
 
-    err = ef_set_next_offset(db, 10, off_b);
+    err = ef_set_next_offset(db, slots[0], off_b);
     expect_err(err, EF_OK, "chase_n link A->B");
-    err = ef_set_next_offset(db, 11, off_c);
+    err = ef_set_next_offset(db, slots[1], off_c);
     expect_err(err, EF_OK, "chase_n link B->C");
 
     slot = ef_chase_n(db, off_a, 2, &hops);
@@ -225,11 +258,11 @@ static void test_chase_n(struct ef_db *db)
     slot = (struct ef_slot *)ef_execute(db, &cmd, &hops_param);
     expect_true(slot != NULL && slot->payload[0] == 'C', "EF_OP_CHASE_N via aux hops");
 
-    err = ef_set_next_offset(db, 10, off_b);
+    err = ef_set_next_offset(db, slots[0], off_b);
     expect_err(err, EF_OK, "cycle link A->B");
-    err = ef_set_next_offset(db, 11, off_c);
+    err = ef_set_next_offset(db, slots[1], off_c);
     expect_err(err, EF_OK, "cycle link B->C");
-    err = ef_set_next_offset(db, 12, off_a);
+    err = ef_set_next_offset(db, slots[2], off_a);
     expect_err(err, EF_OK, "cycle link C->A");
     slot = ef_chase_n(db, off_a, 8, &hops);
     expect_err(ef_last_error(db), EF_ERR_CHASE_CYCLE, "chase_n detects cycle");
@@ -695,6 +728,7 @@ static void test_reopen_existing(void)
 {
     struct ef_db *db = NULL;
     struct ef_slot *slot;
+    uint64_t slot_id = 0;
     enum ef_err err;
 
     err = ef_open_ex("test_rw.endf", 16, &db);
@@ -703,7 +737,9 @@ static void test_reopen_existing(void)
         return;
     }
 
-    err = ef_write_payload(db, 2, "persist me", 10);
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc reopen slot");
+    err = ef_write_payload(db, slot_id, "persist me", 10);
     expect_err(err, EF_OK, "persist payload");
     ef_close(db);
 
@@ -715,7 +751,7 @@ static void test_reopen_existing(void)
 
     expect_true(db->sb->max_slots == 16, "reopen preserves max_slots");
 
-    slot = ef_get_slot(db, 2);
+    slot = ef_get_slot(db, slot_id);
     expect_true(slot != NULL, "reopen get slot");
     expect_true(strcmp(slot->payload, "persist me") == 0, "reopen payload persisted");
     expect_true(slot->status == EF_STATUS_USED, "reopen status persisted");
@@ -769,10 +805,13 @@ static void test_error_paths(struct ef_db *db)
     expect_true(ef_get_slot(db, db->sb->max_slots) == NULL, "get_slot oob");
     expect_err(ef_last_error(db), EF_ERR_SLOT_ID, "get_slot oob error");
 
-    err = ef_write_payload(db, 0, "x", 53);
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc error-path slot");
+
+    err = ef_write_payload(db, slot_id, "x", 53);
     expect_err(err, EF_ERR_PAYLOAD_LEN, "payload too long");
 
-    err = ef_set_next_offset(db, 0, 65);
+    err = ef_set_next_offset(db, slot_id, 65);
     expect_err(err, EF_ERR_OFFSET, "invalid next_offset");
 
     cmd.opcode = 0xFF;
@@ -917,6 +956,7 @@ static void test_readonly_open(void)
 {
     struct ef_db *db = NULL;
     struct ef_db *ro = NULL;
+    uint64_t slot_id = 0;
     enum ef_err err;
 
     remove_test_file("test_ro.endf");
@@ -927,7 +967,9 @@ static void test_readonly_open(void)
         return;
     }
 
-    err = ef_write_payload(db, 0, "frozen", 6);
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc readonly seed slot");
+    err = ef_write_payload(db, slot_id, "frozen", 6);
     expect_err(err, EF_OK, "seed rw db");
     ef_close(db);
 
@@ -935,7 +977,7 @@ static void test_readonly_open(void)
     expect_true(ro != NULL, "open readonly");
     if (ro != NULL) {
         expect_true(ef_is_readonly(ro), "readonly flag");
-        expect_true(strcmp((char *)ef_slot_payload_ptr(ro, ef_get_slot(ro, 0)), "frozen") == 0,
+        expect_true(strcmp((char *)ef_slot_payload_ptr(ro, ef_get_slot(ro, slot_id)), "frozen") == 0,
                     "readonly read payload");
         err = ef_write_payload(ro, 1, "nope", 4);
         expect_err(err, EF_ERR_READONLY, "readonly blocks write");
@@ -1064,15 +1106,19 @@ static void test_v1_upgrade_file(void)
 static void test_slot_header_crc_file(struct ef_db *db)
 {
     struct ef_slot *slot;
+    uint64_t slot_id = 0;
     enum ef_err err;
 
-    err = ef_write_payload(db, 20, "slot-crc", 8);
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc file slot crc");
+
+    err = ef_write_payload(db, slot_id, "slot-crc", 8);
     expect_err(err, EF_OK, "file slot crc write");
-    slot = ef_get_slot(db, 20);
+    slot = ef_get_slot(db, slot_id);
     expect_true(slot != NULL, "file slot crc get");
     if (slot != NULL) {
         slot->payload[0] = 'X';
-        expect_true(ef_get_slot(db, 20) == NULL, "file payload tamper fails crc");
+        expect_true(ef_get_slot(db, slot_id) == NULL, "file payload tamper fails crc");
         expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "file payload tamper error");
     }
 }
@@ -1081,6 +1127,7 @@ static void test_slot_header_crc_persist_file(void)
 {
     struct ef_db *db = NULL;
     struct ef_slot *slot;
+    uint64_t slot_id = 0;
     FILE *fp;
     long pos;
     uint32_t crc;
@@ -1094,7 +1141,9 @@ static void test_slot_header_crc_persist_file(void)
         return;
     }
 
-    err = ef_write_payload(db, 2, "persist-crc", 11);
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "slot crc persist alloc");
+    err = ef_write_payload(db, slot_id, "persist-crc", 11);
     expect_err(err, EF_OK, "slot crc persist write");
     ef_close(db);
 
@@ -1105,7 +1154,7 @@ static void test_slot_header_crc_persist_file(void)
         return;
     }
 
-    pos = (long)(sizeof(struct ef_superblock) + 2 * sizeof(struct ef_slot) +
+    pos = (long)(sizeof(struct ef_superblock) + slot_id * sizeof(struct ef_slot) +
                  offsetof(struct ef_slot, header_crc));
     fseek(fp, pos, SEEK_SET);
     if (!main_io_read(fp, &crc, sizeof(crc))) {
@@ -1127,7 +1176,7 @@ static void test_slot_header_crc_persist_file(void)
     err = ef_open_readonly_ex("test_slot_crc.endf", &db);
     expect_err(err, EF_OK, "slot crc persist readonly reopen");
     if (db != NULL) {
-        slot = ef_get_slot(db, 2);
+        slot = ef_get_slot(db, slot_id);
         expect_true(slot == NULL, "persisted slot crc tamper rejected");
         expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "persisted slot crc error");
         ef_close(db);

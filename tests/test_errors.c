@@ -101,7 +101,9 @@ static void test_readonly_write_attempts(void)
     if (rw == NULL) {
         return;
     }
-    err = ef_write_payload(rw, 0, "seed", 4);
+    err = ef_alloc(rw, &slot_id);
+    expect_err(err, EF_OK, "alloc readonly seed slot");
+    err = ef_write_payload(rw, slot_id, "seed", 4);
     expect_err(err, EF_OK, "seed rw db");
     ef_close(rw);
 
@@ -116,10 +118,10 @@ static void test_readonly_write_attempts(void)
     err = ef_alloc(ro, &slot_id);
     expect_err(err, EF_ERR_READONLY, "readonly blocks ef_alloc");
 
-    err = ef_write_payload(ro, 0, "nope", 4);
+    err = ef_write_payload(ro, slot_id, "nope", 4);
     expect_err(err, EF_ERR_READONLY, "readonly blocks ef_write_payload");
 
-    err = ef_free_slot(ro, 0);
+    err = ef_free_slot(ro, slot_id);
     expect_err(err, EF_ERR_READONLY, "readonly blocks ef_free_slot");
 
     err = ef_queue_push(ro, "msg", 3);
@@ -217,6 +219,7 @@ static void test_payload_length_errors(void)
     static alignas(64) uint8_t buf[64 + 16 * 64];
     struct ef_db *db = NULL;
     uint8_t data[EF_PAYLOAD_SIZE + 1];
+    uint64_t slot_id = 0;
     enum ef_err err;
 
     err = ef_open_memory(buf, sizeof(buf), 16, 1, &db);
@@ -225,7 +228,9 @@ static void test_payload_length_errors(void)
         return;
     }
 
-    err = ef_write_payload(db, 0, data, (uint8_t)(EF_PAYLOAD_SIZE + 1));
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc payload-len slot");
+    err = ef_write_payload(db, slot_id, data, (uint8_t)(EF_PAYLOAD_SIZE + 1));
     expect_err(err, EF_ERR_PAYLOAD_LEN, "payload length EF_PAYLOAD_SIZE + 1 rejected");
 
     ef_close(db);
@@ -283,6 +288,7 @@ static void test_chase_depth(void)
 {
     static alignas(64) uint8_t buf[64 + (EF_CHASE_MAX_DEPTH + 2) * 64];
     struct ef_db *db = NULL;
+    uint64_t slots[EF_CHASE_MAX_DEPTH + 2];
     uint64_t i;
     enum ef_err err;
     uint64_t start;
@@ -295,17 +301,24 @@ static void test_chase_depth(void)
         return;
     }
 
+    memset(slots, 0, sizeof(slots));
+
+    for (i = 0; i < EF_CHASE_MAX_DEPTH + 2; ++i) {
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "alloc chain slot");
+    }
+
     /* Link slots 0 -> 1 -> 2 -> ... -> EF_CHASE_MAX_DEPTH + 1. */
     for (i = 0; i <= EF_CHASE_MAX_DEPTH; ++i) {
-        err = ef_write_payload(db, i, "x", 1);
+        err = ef_write_payload(db, slots[i], "x", 1);
         expect_err(err, EF_OK, "write chain slot");
-        err = ef_set_next_offset(db, i, ef_slot_to_offset(db, i + 1));
+        err = ef_set_next_offset(db, slots[i], ef_slot_to_offset(db, slots[i + 1]));
         expect_err(err, EF_OK, "link chain slot");
     }
-    err = ef_write_payload(db, EF_CHASE_MAX_DEPTH + 1, "y", 1);
+    err = ef_write_payload(db, slots[EF_CHASE_MAX_DEPTH + 1], "y", 1);
     expect_err(err, EF_OK, "write chain tail");
 
-    start = ef_slot_to_offset(db, 0);
+    start = ef_slot_to_offset(db, slots[0]);
     result = ef_chase_n(db, start, EF_CHASE_MAX_DEPTH + 1, &hops);
     expect_true(result == NULL, "chase_n beyond max depth returns null");
     expect_err(ef_last_error(db), EF_ERR_CHASE_DEPTH, "chase_n depth exceeded error");
@@ -318,6 +331,8 @@ static void test_chase_cycle(void)
     static alignas(64) uint8_t buf[64 + 4 * 64];
     struct ef_db *db = NULL;
     enum ef_err err;
+    uint64_t slot_a = 0;
+    uint64_t slot_b = 0;
     uint64_t off_a;
     uint64_t off_b;
     uint32_t hops = 0;
@@ -329,17 +344,22 @@ static void test_chase_cycle(void)
         return;
     }
 
-    err = ef_write_payload(db, 0, "A", 1);
+    err = ef_alloc(db, &slot_a);
+    expect_err(err, EF_OK, "alloc cycle slot A");
+    err = ef_alloc(db, &slot_b);
+    expect_err(err, EF_OK, "alloc cycle slot B");
+
+    err = ef_write_payload(db, slot_a, "A", 1);
     expect_err(err, EF_OK, "write cycle slot A");
-    err = ef_write_payload(db, 1, "B", 1);
+    err = ef_write_payload(db, slot_b, "B", 1);
     expect_err(err, EF_OK, "write cycle slot B");
 
-    off_a = ef_slot_to_offset(db, 0);
-    off_b = ef_slot_to_offset(db, 1);
+    off_a = ef_slot_to_offset(db, slot_a);
+    off_b = ef_slot_to_offset(db, slot_b);
 
-    err = ef_set_next_offset(db, 0, off_b);
+    err = ef_set_next_offset(db, slot_a, off_b);
     expect_err(err, EF_OK, "link A -> B");
-    err = ef_set_next_offset(db, 1, off_a);
+    err = ef_set_next_offset(db, slot_b, off_a);
     expect_err(err, EF_OK, "link B -> A (cycle)");
 
     result = ef_chase_n(db, off_a, 8, &hops);
