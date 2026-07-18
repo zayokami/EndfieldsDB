@@ -1162,7 +1162,7 @@ static enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, st
     enum ef_err err;
 
     err = ef_index_remove_by_slot(db, slot_id);
-    if (err != EF_OK) {
+    if (err != EF_OK && err != EF_ERR_NULL_ARG) {
         ef_set_error(db, err);
         return err;
     }

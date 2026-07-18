@@ -513,7 +513,7 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
     enum ef_err err;
 
     if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
-        return EF_OK;
+        return EF_ERR_NULL_ARG;
     }
 
     err = ef_index_require_write(db);
