@@ -273,83 +273,179 @@ static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint
 #else
 #define EF_ATOMIC_THREAD_FENCE() ((void)0)
 
+#if defined(_WIN32) || defined(_WIN64)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+static CRITICAL_SECTION g_ef_atomic_fallback_lock;
+static INIT_ONCE g_ef_atomic_fallback_init = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ef_atomic_fallback_init_fn(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
+{
+    (void)InitOnce;
+    (void)Parameter;
+    (void)Context;
+    InitializeCriticalSection(&g_ef_atomic_fallback_lock);
+    return TRUE;
+}
+
+static void ef_atomic_fallback_lock(void)
+{
+    InitOnceExecuteOnce(&g_ef_atomic_fallback_init, ef_atomic_fallback_init_fn, NULL, NULL);
+    EnterCriticalSection(&g_ef_atomic_fallback_lock);
+}
+
+static void ef_atomic_fallback_unlock(void)
+{
+    LeaveCriticalSection(&g_ef_atomic_fallback_lock);
+}
+#else
+#include <pthread.h>
+
+static pthread_mutex_t g_ef_atomic_fallback_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ef_atomic_fallback_lock(void)
+{
+    pthread_mutex_lock(&g_ef_atomic_fallback_lock);
+}
+
+static void ef_atomic_fallback_unlock(void)
+{
+    pthread_mutex_unlock(&g_ef_atomic_fallback_lock);
+}
+#endif
+
 static inline uint64_t ef_atomic_load_u64(const volatile void *ptr)
 {
-    return *(const volatile uint64_t *)ptr;
+    uint64_t value;
+
+    ef_atomic_fallback_lock();
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    ef_atomic_fallback_unlock();
+    return value;
 }
 
 static inline void ef_atomic_store_u64(volatile void *ptr, uint64_t value)
 {
-    *(volatile uint64_t *)ptr = value;
+    ef_atomic_fallback_lock();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+    ef_atomic_fallback_unlock();
 }
 
 static inline int ef_atomic_cas_u64(volatile void *ptr, uint64_t *expected, uint64_t desired)
 {
-    volatile uint64_t *p = (volatile uint64_t *)ptr;
+    uint64_t cur;
+    int ret;
 
-    if (*p != *expected) {
-        *expected = *p;
-        return 0;
+    ef_atomic_fallback_lock();
+    memcpy(&cur, (const void *)ptr, sizeof(cur));
+    if (cur == *expected) {
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        ret = 1;
+    } else {
+        *expected = cur;
+        ret = 0;
     }
-    *p = desired;
-    return 1;
-}
-
-static inline void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
-{
-    *(volatile uint32_t *)ptr = value;
+    ef_atomic_fallback_unlock();
+    return ret;
 }
 
 static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
 {
-    return *(const volatile uint32_t *)ptr;
+    uint32_t value;
+
+    ef_atomic_fallback_lock();
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    ef_atomic_fallback_unlock();
+    return value;
+}
+
+static inline void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
+{
+    ef_atomic_fallback_lock();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+    ef_atomic_fallback_unlock();
 }
 
 static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
 {
-    volatile uint32_t *p = (volatile uint32_t *)ptr;
+    uint32_t cur;
+    int ret;
 
-    if (*p != *expected) {
-        *expected = *p;
-        return 0;
+    ef_atomic_fallback_lock();
+    memcpy(&cur, (const void *)ptr, sizeof(cur));
+    if (cur == *expected) {
+        memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
+        ret = 1;
+    } else {
+        *expected = cur;
+        ret = 0;
     }
-    *p = desired;
-    return 1;
+    ef_atomic_fallback_unlock();
+    return ret;
 }
 
 static inline uint8_t ef_atomic_load_u8(const volatile void *ptr)
 {
     uint8_t value;
 
+    ef_atomic_fallback_lock();
     memcpy(&value, (const void *)ptr, sizeof(value));
-    EF_ATOMIC_THREAD_FENCE();
+    ef_atomic_fallback_unlock();
     return value;
 }
 
 static inline void ef_atomic_store_u8(volatile void *ptr, uint8_t value)
 {
-    EF_ATOMIC_THREAD_FENCE();
+    ef_atomic_fallback_lock();
     memcpy((void *)ptr, (const void *)&value, sizeof(value));
+    ef_atomic_fallback_unlock();
 }
 
 static inline int ef_atomic_cas_u8(volatile void *ptr, uint8_t *expected, uint8_t desired)
 {
     uint8_t cur;
+    int ret;
 
-    for (;;) {
-        memcpy(&cur, (const void *)ptr, sizeof(cur));
-        if (cur != *expected) {
-            *expected = cur;
-            return 0;
-        }
+    ef_atomic_fallback_lock();
+    memcpy(&cur, (const void *)ptr, sizeof(cur));
+    if (cur == *expected) {
         memcpy((void *)ptr, (const void *)&desired, sizeof(desired));
-        EF_ATOMIC_THREAD_FENCE();
-        memcpy(&cur, (const void *)ptr, sizeof(cur));
-        if (cur == desired) {
-            return 1;
-        }
+        ret = 1;
+    } else {
         *expected = cur;
+        ret = 0;
     }
+    ef_atomic_fallback_unlock();
+    return ret;
+}
+
+static inline uint32_t ef_atomic_fetch_add_u32(volatile void *ptr, uint32_t delta)
+{
+    uint32_t prev;
+    uint32_t next;
+
+    ef_atomic_fallback_lock();
+    memcpy(&prev, (const void *)ptr, sizeof(prev));
+    next = prev + delta;
+    memcpy((void *)ptr, (const void *)&next, sizeof(next));
+    ef_atomic_fallback_unlock();
+    return prev;
+}
+
+static inline uint32_t ef_atomic_fetch_sub_u32(volatile void *ptr, uint32_t delta)
+{
+    uint32_t prev;
+    uint32_t next;
+
+    ef_atomic_fallback_lock();
+    memcpy(&prev, (const void *)ptr, sizeof(prev));
+    next = prev - delta;
+    memcpy((void *)ptr, (const void *)&next, sizeof(next));
+    ef_atomic_fallback_unlock();
+    return prev;
 }
 #endif
 
