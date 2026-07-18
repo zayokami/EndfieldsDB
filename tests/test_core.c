@@ -357,6 +357,66 @@ static void test_slot_iterator_memory(void)
     ef_close(db);
 }
 
+static int stop_after_one_visit(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot, void *ctx)
+{
+    int *count = (int *)ctx;
+    (void)db;
+    (void)slot_id;
+    (void)slot;
+    ++*count;
+    return 0;
+}
+
+static void test_iterator_edge_cases(struct ef_db *db)
+{
+    static alignas(64) uint8_t arena[64 + 8 * 64];
+    struct ef_db *it_db = NULL;
+    struct ef_slot_iter it;
+    enum ef_err err;
+    uint64_t id1 = 0;
+    uint64_t id2 = 0;
+    uint64_t found_id = 0;
+    struct ef_slot *found_slot = NULL;
+    int visit_count = 0;
+
+    (void)db;
+
+    err = ef_open_memory(arena, sizeof(arena), 8, 1, &it_db);
+    expect_err(err, EF_OK, "iterator edge open memory");
+    if (it_db == NULL) {
+        return;
+    }
+
+    err = ef_foreach_used(it_db, count_used_visit, &visit_count);
+    expect_err(err, EF_OK, "foreach_used on empty DB");
+    expect_true(visit_count == 0, "foreach_used visits nothing on empty DB");
+
+    ef_slot_iter_init(it_db, &it);
+    expect_true(ef_slot_iter_next(&it, &found_id, &found_slot) == 0,
+                "slot_iter_next on empty DB returns 0");
+
+    err = ef_alloc_slot(it_db, &id1);
+    expect_err(err, EF_OK, "iter edge alloc first");
+    err = ef_write_payload(it_db, id1, "first", 5);
+    expect_err(err, EF_OK, "iter edge write first");
+    err = ef_alloc_slot(it_db, &id2);
+    expect_err(err, EF_OK, "iter edge alloc second");
+    err = ef_write_payload(it_db, id2, "second", 6);
+    expect_err(err, EF_OK, "iter edge write second");
+
+    visit_count = 0;
+    err = ef_foreach_used(it_db, stop_after_one_visit, &visit_count);
+    expect_err(err, EF_OK, "foreach_used stops on visitor returning 0");
+    expect_true(visit_count == 1, "foreach_used visited only one slot");
+
+    err = ef_free_slot(it_db, id1);
+    expect_err(err, EF_OK, "iter edge free first");
+    err = ef_free_slot(it_db, id2);
+    expect_err(err, EF_OK, "iter edge free second");
+
+    ef_close(it_db);
+}
+
 static void test_blob_memory(void)
 {
     static alignas(64) uint8_t buf[64 + 64 * 64];
@@ -405,6 +465,84 @@ static void test_blob_memory(void)
     expect_true(ef_count_free_slots(db) == 64, "blob free restores all slots");
 
     ef_close(db);
+}
+
+static void test_blob_edge_cases(struct ef_db *db)
+{
+    uint64_t slot_id = 0;
+    enum ef_err err;
+    uint8_t blob[120];
+    uint8_t out[120];
+    size_t out_len = 0;
+    size_t inline_cap;
+    size_t i;
+
+    /* Zero-length blob round-trip. */
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "blob edge alloc zero-length");
+    err = ef_write_blob(db, slot_id, NULL, 0);
+    expect_err(err, EF_OK, "write zero-length blob");
+    expect_true(ef_blob_size(db, slot_id) == 0, "zero-length blob size");
+    out_len = 1;
+    err = ef_read_blob(db, slot_id, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "read zero-length blob");
+    expect_true(out_len == 0, "zero-length blob read length");
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free zero-length blob slot");
+
+    /* Blob length exactly equal to inline capacity. */
+    inline_cap = ef_blob_inline_capacity(db);
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "blob edge alloc inline capacity");
+    for (i = 0; i < inline_cap; ++i) {
+        blob[i] = (uint8_t)(i & 0xFFU);
+    }
+    err = ef_write_blob(db, slot_id, blob, inline_cap);
+    expect_err(err, EF_OK, "write blob at inline capacity");
+    expect_true(ef_blob_size(db, slot_id) == inline_cap, "blob size at inline capacity");
+    expect_true(db->slots[slot_id].next_offset == 0, "blob at inline capacity has no overflow");
+    memset(out, 0, sizeof(out));
+    err = ef_read_blob(db, slot_id, out, sizeof(out), &out_len);
+    expect_err(err, EF_OK, "read blob at inline capacity");
+    expect_true(out_len == inline_cap, "read length at inline capacity");
+    expect_true(memcmp(blob, out, inline_cap) == 0, "payload at inline capacity");
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free inline-capacity blob slot");
+
+    /* Buffer smaller than stored blob: API truncates and reports full length. */
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "blob edge alloc small buffer");
+    for (i = 0; i < sizeof(blob); ++i) {
+        blob[i] = (uint8_t)(0xA5U ^ (i & 0xFFU));
+    }
+    err = ef_write_blob(db, slot_id, blob, sizeof(blob));
+    expect_err(err, EF_OK, "write blob for small-buffer test");
+    memset(out, 0, sizeof(out));
+    err = ef_read_blob(db, slot_id, out, 10, &out_len);
+    expect_err(err, EF_OK, "read blob into too-small buffer");
+    expect_true(out_len == sizeof(blob), "too-small buffer reports full length");
+    expect_true(memcmp(blob, out, 10) == 0, "too-small buffer partial content");
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free small-buffer blob slot");
+
+    /* Corrupted blob magic: ef_read_blob reports EF_ERR_NOT_FOUND. */
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "blob edge alloc corrupt magic");
+    err = ef_write_blob(db, slot_id, "corruptme", 9);
+    expect_err(err, EF_OK, "write blob for corrupt magic");
+    {
+        uint8_t *payload = (uint8_t *)ef_slot_payload_ptr(db, ef_get_slot(db, slot_id));
+        payload[0] = 'X';
+        payload[1] = 'X';
+        payload[2] = 'X';
+        payload[3] = 'X';
+    }
+    ef_db_refresh_slot_crcs(db);
+    memset(out, 0, sizeof(out));
+    err = ef_read_blob(db, slot_id, out, sizeof(out), &out_len);
+    expect_err(err, EF_ERR_NOT_FOUND, "corrupted blob magic returns NOT_FOUND");
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free corrupt-magic blob slot");
 }
 
 static void test_v1_upgrade_memory(void)
@@ -1339,6 +1477,8 @@ int main(void)
     test_chase_n(db);
     test_error_paths(db);
     test_slot_header_crc_file(db);
+    test_blob_edge_cases(db);
+    test_iterator_edge_cases(db);
     test_sync(db);
     ef_close(db);
 

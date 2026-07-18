@@ -231,6 +231,139 @@ static void test_index_get_slot(void)
     ef_close(db);
 }
 
+static void test_index_edge_cases(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t rehash_arena[64 + 64 * 16 + 128 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_a = 0;
+    uint64_t slot_b = 0;
+    uint64_t looked = 0;
+    const char *empty = "";
+    const char *dup_key = "dup:key";
+    char buf[64];
+    size_t len = 0;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 8, 16, 1, &db);
+    expect_err(err, EF_OK, "index edge open");
+    if (db == NULL) {
+        return;
+    }
+
+    /* Empty-string key round-trip. */
+    err = ef_alloc(db, &slot_a);
+    expect_err(err, EF_OK, "index edge alloc empty key");
+    err = ef_write_payload(db, slot_a, "empty-key-value", 15);
+    expect_err(err, EF_OK, "index edge write empty key value");
+    err = ef_index_put(db, empty, slot_a);
+    expect_err(err, EF_OK, "index put empty string key");
+    err = ef_index_get(db, empty, &looked);
+    expect_err(err, EF_OK, "index get empty string key");
+    expect_true(looked == slot_a, "empty string key roundtrip slot id");
+    err = ef_index_remove(db, empty);
+    expect_err(err, EF_OK, "index remove empty string key");
+    expect_err(ef_index_get(db, empty, &looked), EF_ERR_NOT_FOUND,
+               "empty string key removed");
+    err = ef_free_slot(db, slot_a);
+    expect_err(err, EF_OK, "index edge free empty key slot");
+
+    /* Duplicate key update. */
+    err = ef_alloc(db, &slot_a);
+    expect_err(err, EF_OK, "index edge alloc dup A");
+    err = ef_write_payload(db, slot_a, "A", 1);
+    expect_err(err, EF_OK, "index edge write dup A");
+    err = ef_index_put(db, dup_key, slot_a);
+    expect_err(err, EF_OK, "index put dup A");
+    err = ef_alloc(db, &slot_b);
+    expect_err(err, EF_OK, "index edge alloc dup B");
+    err = ef_write_payload(db, slot_b, "B", 1);
+    expect_err(err, EF_OK, "index edge write dup B");
+    err = ef_index_put(db, dup_key, slot_b);
+    expect_err(err, EF_OK, "index put dup B");
+    err = ef_index_get(db, dup_key, &looked);
+    expect_err(err, EF_OK, "index get dup after update");
+    expect_true(looked == slot_b, "duplicate key updated to slot B");
+
+    /* Invalid rehash capacities. */
+    expect_err(ef_index_rehash(db, 0U), EF_ERR_GROW, "rehash to 0 rejected");
+    expect_err(ef_index_rehash(db, 15U), EF_ERR_GROW,
+               "rehash to non-power-of-two rejected");
+    expect_err(ef_index_rehash(db, 8U), EF_ERR_GROW,
+               "rehash to smaller capacity rejected");
+    expect_err(ef_index_rehash(db, 0x10000U), EF_ERR_GROW,
+               "rehash above max capacity rejected");
+
+    ef_close(db);
+
+    /* ef_index_get_slot after auto-rehash. */
+    db = NULL;
+    err = ef_open_memory_hash(rehash_arena, sizeof(rehash_arena), 128, 16, 1, &db);
+    expect_err(err, EF_OK, "index edge open for auto rehash");
+    if (db == NULL) {
+        return;
+    }
+    {
+        uint32_t i;
+        char key[24];
+
+        for (i = 0; i < 13; ++i) {
+            uint64_t sid = 0;
+
+            snprintf(key, sizeof(key), "rehash-%02u", i);
+            err = ef_alloc(db, &sid);
+            expect_err(err, EF_OK, "index edge alloc for auto rehash");
+            err = ef_write_payload(db, sid, key, (uint8_t)strlen(key));
+            expect_err(err, EF_OK, "index edge write for auto rehash");
+            err = ef_index_put(db, key, sid);
+            expect_err(err, EF_OK, "index edge put for auto rehash");
+        }
+    }
+    expect_true(ef_index_capacity(db) == 32, "auto rehash grew to 32");
+
+    memset(buf, 0, sizeof(buf));
+    err = ef_index_get_slot(db, "rehash-00", NULL, buf, sizeof(buf), &len);
+    expect_err(err, EF_OK, "index_get_slot after auto rehash");
+    expect_true(len == ef_payload_capacity(db),
+                "index_get_slot payload len after rehash");
+    expect_true(memcmp(buf, "rehash-00", 9) == 0,
+                "index_get_slot payload after rehash");
+
+    ef_close(db);
+
+#if EF_HAS_FILE_IO
+    {
+        struct ef_db *rw = NULL;
+        struct ef_db *ro = NULL;
+        uint64_t file_slot = 0;
+
+        remove_test_file("test_index_ro.endf");
+        err = ef_open_ex_hash("test_index_ro.endf", 8, 16, &rw);
+        expect_err(err, EF_OK, "index edge rw open");
+        if (rw == NULL) {
+            return;
+        }
+        err = ef_alloc(rw, &file_slot);
+        expect_err(err, EF_OK, "index edge rw alloc");
+        err = ef_write_payload(rw, file_slot, "readonly-value", 14);
+        expect_err(err, EF_OK, "index edge rw write");
+        err = ef_index_put(rw, "ro:key", file_slot);
+        expect_err(err, EF_OK, "index edge rw put");
+        ef_close(rw);
+
+        err = ef_open_readonly_ex("test_index_ro.endf", &ro);
+        expect_err(err, EF_OK, "index edge readonly open");
+        if (ro != NULL) {
+            err = ef_index_get(ro, "ro:key", &looked);
+            expect_err(err, EF_OK, "index get on readonly db");
+            expect_true(looked == file_slot, "readonly index get slot id");
+            ef_close(ro);
+        }
+        remove_test_file("test_index_ro.endf");
+    }
+#endif
+}
+
 static void test_index_lifecycle_and_rehash(void)
 {
     static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64];
@@ -1112,6 +1245,7 @@ int main(void)
     test_v3_alloc_queue_index();
     test_execute_queue_and_index();
     test_index_get_slot();
+    test_index_edge_cases();
     test_index_lifecycle_and_rehash();
     test_index_auto_rehash();
 #if EF_HAS_FILE_IO
