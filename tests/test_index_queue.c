@@ -175,6 +175,62 @@ static void test_execute_queue_and_index(void)
     ef_close(db);
 }
 
+static void test_index_get_slot(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id = 0;
+    struct ef_slot *slot = NULL;
+    char buf[64];
+    size_t len = 0;
+    const char *key = "get-slot:key";
+
+    printf("\n=== v4: ef_index_get_slot atomic index+slot read ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 1, &db);
+    expect_err(err, EF_OK, "open for index_get_slot");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for index_get_slot");
+    err = ef_write_payload(db, slot_id, "indexed", 7);
+    expect_err(err, EF_OK, "write payload for index_get_slot");
+    err = ef_index_put(db, key, slot_id);
+    expect_err(err, EF_OK, "index put for index_get_slot");
+
+    memset(buf, 0, sizeof(buf));
+    err = ef_index_get_slot(db, key, &slot, buf, sizeof(buf), &len);
+    expect_err(err, EF_OK, "index_get_slot with buffer");
+    expect_true(slot != NULL, "index_get_slot slot_out non-NULL");
+    expect_true(len == ef_payload_capacity(db), "index_get_slot payload_len_out");
+    expect_true(memcmp(buf, "indexed", 7) == 0, "index_get_slot payload matches");
+
+    memset(buf, 0, sizeof(buf));
+    len = 0;
+    err = ef_index_get_slot(db, key, NULL, buf, 4, &len);
+    expect_err(err, EF_ERR_PAYLOAD_LEN, "index_get_slot too-small buffer");
+    expect_true(len == ef_payload_capacity(db), "index_get_slot payload_len_out on short buf");
+
+    len = 0;
+    err = ef_index_get_slot(db, key, NULL, NULL, 0, &len);
+    expect_err(err, EF_OK, "index_get_slot NULL buffer");
+    expect_true(len == ef_payload_capacity(db), "index_get_slot length only");
+
+    err = ef_index_get_slot(db, "missing-key", NULL, buf, sizeof(buf), &len);
+    expect_err(err, EF_ERR_NOT_FOUND, "index_get_slot missing key");
+
+    err = ef_free_slot(db, slot_id);
+    expect_err(err, EF_OK, "free indexed slot");
+    err = ef_index_get_slot(db, key, NULL, buf, sizeof(buf), &len);
+    expect_true(err == EF_ERR_NOT_FOUND || err == EF_ERR_SLOT_FREE,
+                "index_get_slot after free returns NOT_FOUND or SLOT_FREE");
+
+    ef_close(db);
+}
+
 static void test_index_lifecycle_and_rehash(void)
 {
     static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64];
@@ -1055,6 +1111,7 @@ int main(void)
 
     test_v3_alloc_queue_index();
     test_execute_queue_and_index();
+    test_index_get_slot();
     test_index_lifecycle_and_rehash();
     test_index_auto_rehash();
 #if EF_HAS_FILE_IO

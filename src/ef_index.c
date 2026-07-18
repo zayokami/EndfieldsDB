@@ -412,6 +412,210 @@ enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_ou
     return ef_offset_to_slot_id(db, found.slot_offset, slot_id_out);
 }
 
+static enum ef_err ef_index_find_entry_in_layout(uint64_t key_hash, struct ef_hash_entry *out,
+                                                 uint32_t capacity,
+                                                 const struct ef_hash_entry *hash_index)
+{
+    uint32_t home;
+    uint32_t i;
+
+    if (out == NULL || hash_index == NULL || capacity == 0) {
+        return EF_ERR_NULL_ARG;
+    }
+    if ((capacity & (capacity - 1U)) != 0) {
+        return EF_ERR_BAD_VERSION;
+    }
+
+    home = ef_hash_home(capacity, key_hash);
+
+    for (i = home; i < home + capacity; ++i) {
+        const struct ef_hash_entry *entry = hash_index + (i % capacity);
+        struct ef_hash_entry cur;
+
+        ef_hash_entry_load_atomic(entry, &cur);
+
+        if (ef_hash_entry_empty_atomic(entry)) {
+            return EF_ERR_NOT_FOUND;
+        }
+        if (cur.key_hash == key_hash) {
+            *out = cur;
+            return EF_OK;
+        }
+    }
+
+    return EF_ERR_NOT_FOUND;
+}
+
+static enum ef_err ef_index_copy_slot_payload(struct ef_db *db, const struct ef_slot *slot,
+                                              void *payload_buf, size_t buf_cap,
+                                              size_t *payload_len_out)
+{
+    size_t capacity;
+
+    if (db == NULL || slot == NULL || payload_len_out == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+
+    capacity = ef_payload_capacity(db);
+    *payload_len_out = capacity;
+
+    if (payload_buf == NULL) {
+        return EF_OK;
+    }
+
+    if (buf_cap < capacity) {
+        return EF_ERR_PAYLOAD_LEN;
+    }
+
+    memcpy(payload_buf, ef_slot_payload_ptr(db, (struct ef_slot *)slot), capacity);
+    return EF_OK;
+}
+
+enum ef_err ef_index_get_slot(struct ef_db *db, const char *key, struct ef_slot **slot_out,
+                              void *payload_buf, size_t buf_cap, size_t *payload_len_out)
+{
+    uint64_t key_hash;
+    int need_payload;
+
+    if (db == NULL || key == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+
+    need_payload = payload_buf != NULL || payload_len_out != NULL;
+    if (slot_out == NULL && !need_payload) {
+        return EF_ERR_NULL_ARG;
+    }
+
+    key_hash = ef_key_hash(key, strlen(key));
+
+    if (!ef_index_has_seqlock(db)) {
+        struct ef_hash_entry found;
+        struct ef_slot *slot;
+        uint64_t slot_id;
+        enum ef_err err;
+
+        err = ef_index_find_entry_unlocked(db, key_hash, &found);
+        if (err != EF_OK) {
+            return err;
+        }
+
+        err = ef_offset_to_slot_id(db, found.slot_offset, &slot_id);
+        if (err != EF_OK) {
+            return err;
+        }
+
+        slot = ef_peek_slot(db, slot_id);
+        if (slot == NULL) {
+            return EF_ERR_SLOT_ID;
+        }
+
+        if (slot->status == EF_STATUS_FREE) {
+            return EF_ERR_SLOT_FREE;
+        }
+
+        if (need_payload) {
+            err = ef_index_copy_slot_payload(db, slot, payload_buf, buf_cap, payload_len_out);
+            if (err != EF_OK) {
+                return err;
+            }
+        }
+
+        if (slot_out != NULL) {
+            *slot_out = slot;
+        }
+
+        return EF_OK;
+    }
+
+    {
+        uint32_t attempt;
+
+        for (attempt = 0; attempt < EF_SB_INDEX_SEQ_READ_MAX; ++attempt) {
+            uint32_t seq1;
+            uint32_t capacity;
+            const struct ef_hash_entry *hash_index;
+            uint64_t slots_base;
+            struct ef_slot *slots;
+            uint64_t max_slots;
+            struct ef_hash_entry found;
+            uint64_t slot_id;
+            struct ef_slot *slot;
+            uint32_t status;
+            enum ef_err err;
+            enum ef_err copy_err = EF_OK;
+
+            seq1 = ef_sb_index_seq_load(db->sb);
+            if ((seq1 & 1U) != 0U) {
+                ef_index_read_yield(attempt);
+                continue;
+            }
+
+            capacity = db->hash_capacity;
+            hash_index = db->hash_index;
+            slots_base = db->slots_base;
+            slots = db->slots;
+            max_slots = db->sb->max_slots;
+
+            err = ef_index_find_entry_in_layout(key_hash, &found, capacity, hash_index);
+            if (err == EF_ERR_NOT_FOUND) {
+                if (ef_sb_index_seq_read_stable(db->sb, seq1)) {
+                    return EF_ERR_NOT_FOUND;
+                }
+                ef_index_read_yield(attempt);
+                continue;
+            }
+            if (err != EF_OK) {
+                ef_index_read_yield(attempt);
+                continue;
+            }
+
+            if (found.slot_offset < slots_base ||
+                found.slot_offset >= slots_base + (max_slots << EF_SLOT_SHIFT)) {
+                ef_index_read_yield(attempt);
+                continue;
+            }
+            if (((found.slot_offset - slots_base) & EF_SLOT_MASK) != 0) {
+                ef_index_read_yield(attempt);
+                continue;
+            }
+
+            slot_id = (found.slot_offset - slots_base) >> EF_SLOT_SHIFT;
+            slot = slots + slot_id;
+
+            status = ef_atomic_load_u32((const void *)&slot->status);
+            if (status == EF_STATUS_FREE) {
+                if (ef_sb_index_seq_read_stable(db->sb, seq1)) {
+                    return EF_ERR_SLOT_FREE;
+                }
+                ef_index_read_yield(attempt);
+                continue;
+            }
+
+            if (need_payload) {
+                copy_err = ef_index_copy_slot_payload(db, slot, payload_buf, buf_cap,
+                                                      payload_len_out);
+            }
+
+            if (!ef_sb_index_seq_read_stable(db->sb, seq1)) {
+                ef_index_read_yield(attempt);
+                continue;
+            }
+
+            if (copy_err != EF_OK) {
+                return copy_err;
+            }
+
+            if (slot_out != NULL) {
+                *slot_out = slot;
+            }
+
+            return EF_OK;
+        }
+    }
+
+    return EF_ERR_INDEX_BUSY;
+}
+
 #if EF_HAS_FILE_IO
 static void ef_index_db_to_io(const struct ef_db *db, struct ef_io *io)
 {
