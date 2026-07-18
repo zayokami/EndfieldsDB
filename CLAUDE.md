@@ -176,7 +176,7 @@ When modifying code, keep these invariants in mind:
 | `src/ef_sb_layout.h` / `src/ef_sb_layout.c` | Superblock `reserved[]` field layout and v3→v4 migration |
 | `src/ef_port.h` / `src/ef_port.c` | File/memory mapping backend abstraction |
 | `src/ef_crc.h` / `src/ef_crc.c` / `src/ef_crc_pclmul.c` | CRC32 implementations |
-| `src/ef_atomic_unaligned.h` | Atomic helpers for unaligned mmap fields |
+| `src/ef_atomic_unaligned.h` | Atomic helpers for unaligned mmap fields; GCC/Clang/MSVC are lock-free, unknown compilers use a mutex fallback |
 | `src/ef_config.h` | Schema version, prefetch, atomics, platform switches |
 | `tests/test_core.c` | Core, file, memory, CRC, blob tests |
 | `tests/test_index_queue.c` | Index, queue, concurrency, migration tests |
