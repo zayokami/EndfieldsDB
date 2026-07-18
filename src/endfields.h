@@ -74,9 +74,11 @@ struct ef_superblock {
  *    count is read from aux and field_offset is overwritten with the actual
  *    number of hops performed on output (capped at 255)
  *  - EF_OP_GET_FIELD / EF_OP_WRITE_FIELD: byte offset into the slot payload
- *  - EF_OP_QUEUE_PUSH / EF_OP_QUEUE_POP / EF_OP_INDEX_PUT / EF_OP_INDEX_GET /
- *    EF_OP_INDEX_REMOVE: payload/key length in bytes (0 for index opcodes
- *    means use strlen(key))
+ *  - EF_OP_QUEUE_PUSH / EF_OP_QUEUE_POP: payload length in bytes
+ *  - EF_OP_INDEX_PUT: cmd->param = key pointer; aux = pointer to uint64_t slot_id
+ *  - EF_OP_INDEX_GET: cmd->param = key pointer; aux = pointer to uint64_t slot_id_out
+ *  - EF_OP_INDEX_REMOVE: cmd->param = key pointer
+ *  - For index opcodes, field_offset = key length in bytes (0 means strlen(key))
  */
 #pragma pack(push, 1)
 struct ef_cmd {

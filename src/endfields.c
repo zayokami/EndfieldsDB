@@ -2706,28 +2706,28 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
         cmd->field_offset = (uint8_t)n;
         return (void *)(uintptr_t)1;
     }
-    case EF_OP_INDEX_PUT:
+    case EF_OP_INDEX_PUT: {
+        const uint64_t *slot_id_in;
         if (aux == NULL) {
             ef_set_error(db, EF_ERR_NULL_ARG);
             return NULL;
         }
-        err = ef_index_put(db, (const char *)aux, cmd->param);
+        slot_id_in = (const uint64_t *)aux;
+        err = ef_index_put(db, (const char *)cmd->param, *slot_id_in);
         return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
+    }
     case EF_OP_INDEX_GET: {
-        uint64_t slot_id = 0;
+        uint64_t *slot_id_out;
         if (aux == NULL) {
             ef_set_error(db, EF_ERR_NULL_ARG);
             return NULL;
         }
-        err = ef_index_get(db, (const char *)aux, &slot_id);
-        return (err == EF_OK) ? (void *)(uintptr_t)slot_id : NULL;
+        slot_id_out = (uint64_t *)aux;
+        err = ef_index_get(db, (const char *)cmd->param, slot_id_out);
+        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
     }
     case EF_OP_INDEX_REMOVE:
-        if (aux == NULL) {
-            ef_set_error(db, EF_ERR_NULL_ARG);
-            return NULL;
-        }
-        err = ef_index_remove(db, (const char *)aux);
+        err = ef_index_remove(db, (const char *)cmd->param);
         return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
     default:
         ef_set_error(db, EF_ERR_OPCODE);

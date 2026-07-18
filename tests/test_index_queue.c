@@ -117,6 +117,7 @@ static void test_execute_queue_and_index(void)
     struct ef_cmd cmd;
     enum ef_err err;
     uint64_t slot_id = 0;
+    uint64_t looked = 0;
     char out[64];
     const char *msg = "exec-queue";
     const char *key = "exec:key";
@@ -147,35 +148,26 @@ static void test_execute_queue_and_index(void)
 
     err = ef_alloc(db, &slot_id);
     expect_err(err, EF_OK, "execute index alloc");
-    if (slot_id == 0) {
-        /* Slot 0 returned as a pointer is indistinguishable from NULL; keep it
-         * used and allocate a non-zero slot for the index round-trip. */
-        err = ef_write_payload(db, slot_id, "reserved", 8);
-        expect_err(err, EF_OK, "execute index reserve slot 0");
-        err = ef_alloc(db, &slot_id);
-        expect_err(err, EF_OK, "execute index alloc non-zero");
-    }
-    expect_true(slot_id != 0, "execute index slot id non-zero");
     err = ef_write_payload(db, slot_id, "indexed", 7);
     expect_err(err, EF_OK, "execute index write");
 
     cmd.opcode = EF_OP_INDEX_PUT;
-    cmd.param = slot_id;
+    cmd.param = (uint64_t)(uintptr_t)key;
     cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, key);
+    result = ef_execute(db, &cmd, &slot_id);
     expect_true(result != NULL, "EF_OP_INDEX_PUT result");
 
     cmd.opcode = EF_OP_INDEX_GET;
-    cmd.param = 0;
+    cmd.param = (uint64_t)(uintptr_t)key;
     cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, key);
+    result = ef_execute(db, &cmd, &looked);
     expect_true(result != NULL, "EF_OP_INDEX_GET result");
-    expect_true((uint64_t)(uintptr_t)result == slot_id, "EF_OP_INDEX_GET slot id");
+    expect_true(looked == slot_id, "EF_OP_INDEX_GET slot id");
 
     cmd.opcode = EF_OP_INDEX_REMOVE;
-    cmd.param = 0;
+    cmd.param = (uint64_t)(uintptr_t)key;
     cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, key);
+    result = ef_execute(db, &cmd, NULL);
     expect_true(result != NULL, "EF_OP_INDEX_REMOVE result");
     expect_err(ef_index_get(db, key, &slot_id), EF_ERR_NOT_FOUND,
                "index miss after execute remove");
