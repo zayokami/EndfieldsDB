@@ -2075,10 +2075,6 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
         ef_set_error(db, EF_ERR_NULL_ARG);
         return EF_ERR_NULL_ARG;
     }
-    if (len > EF_PAYLOAD_SIZE) {
-        ef_set_error(db, EF_ERR_PAYLOAD_LEN);
-        return EF_ERR_PAYLOAD_LEN;
-    }
 
     cap = ef_payload_capacity(db);
     if (len > cap) {
@@ -2620,7 +2616,6 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
     struct ef_slot *slot;
     const uint64_t *next_ptr;
     const uint32_t *status_ptr;
-    const uint32_t *hops_ptr;
     const uint8_t *byte_ptr;
     enum ef_err err;
 
@@ -2673,17 +2668,67 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
         return (err == EF_OK) ? ef_get_slot(db, *(const uint64_t *)aux) : NULL;
     case EF_OP_FREE:
         err = ef_free_slot(db, cmd->param);
-        return (err == EF_OK) ? NULL : NULL;
-    case EF_OP_CHASE_N:
+        return (err == EF_OK) ? ef_peek_slot(db, cmd->param) : NULL;
+    case EF_OP_CHASE_N: {
+        uint32_t hops_done = 0;
+        uint32_t hops;
         if (cmd->field_offset == 0) {
             if (aux == NULL) {
                 ef_set_error(db, EF_ERR_NULL_ARG);
+                cmd->field_offset = 0;
                 return NULL;
             }
-            hops_ptr = (const uint32_t *)aux;
-            return ef_chase_n(db, cmd->param, *hops_ptr, NULL);
+            hops = *(const uint32_t *)aux;
+        } else {
+            hops = cmd->field_offset;
         }
-        return ef_chase_n(db, cmd->param, cmd->field_offset, NULL);
+        slot = ef_chase_n(db, cmd->param, hops, &hops_done);
+        cmd->field_offset = (uint8_t)hops_done;
+        return slot;
+    }
+    case EF_OP_QUEUE_PUSH:
+        if ((aux == NULL && cmd->field_offset != 0) || cmd->field_offset > 47) {
+            ef_set_error(db, EF_ERR_PAYLOAD_LEN);
+            return NULL;
+        }
+        err = ef_queue_push(db, aux, cmd->field_offset);
+        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
+    case EF_OP_QUEUE_POP: {
+        size_t n = 0;
+        if (aux == NULL) {
+            ef_set_error(db, EF_ERR_NULL_ARG);
+            return NULL;
+        }
+        err = ef_queue_pop(db, (void *)aux, cmd->field_offset, &n);
+        if (err != EF_OK) {
+            return NULL;
+        }
+        cmd->field_offset = (uint8_t)n;
+        return (void *)(uintptr_t)1;
+    }
+    case EF_OP_INDEX_PUT:
+        if (aux == NULL) {
+            ef_set_error(db, EF_ERR_NULL_ARG);
+            return NULL;
+        }
+        err = ef_index_put(db, (const char *)aux, cmd->param);
+        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
+    case EF_OP_INDEX_GET: {
+        uint64_t slot_id = 0;
+        if (aux == NULL) {
+            ef_set_error(db, EF_ERR_NULL_ARG);
+            return NULL;
+        }
+        err = ef_index_get(db, (const char *)aux, &slot_id);
+        return (err == EF_OK) ? (void *)(uintptr_t)slot_id : NULL;
+    }
+    case EF_OP_INDEX_REMOVE:
+        if (aux == NULL) {
+            ef_set_error(db, EF_ERR_NULL_ARG);
+            return NULL;
+        }
+        err = ef_index_remove(db, (const char *)aux);
+        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
     default:
         ef_set_error(db, EF_ERR_OPCODE);
         return NULL;

@@ -80,6 +80,68 @@ static void test_write_execute(struct ef_db *db)
                 "EF_OP_WRITE_FIELD byte");
 }
 
+static void test_execute_get_slot_and_field(struct ef_db *db)
+{
+    struct ef_cmd cmd;
+    struct ef_slot *slot_via_get;
+    struct ef_slot *slot_via_execute;
+    struct ef_slot *slot;
+    uint64_t off_a;
+    uint64_t off_b;
+    uint64_t off_c;
+    uint8_t byte = 0xCD;
+    enum ef_err err;
+
+    err = ef_write_payload(db, 20, "execute", 7);
+    expect_err(err, EF_OK, "execute setup payload");
+
+    slot_via_get = ef_get_slot(db, 20);
+    cmd.opcode = EF_OP_GET_SLOT;
+    cmd.param = 20;
+    cmd.field_offset = 0;
+    slot_via_execute = (struct ef_slot *)ef_execute(db, &cmd, NULL);
+    expect_true(slot_via_get != NULL && slot_via_execute == slot_via_get,
+                "EF_OP_GET_SLOT matches ef_get_slot");
+
+    cmd.opcode = EF_OP_WRITE_FIELD;
+    cmd.param = 20;
+    cmd.field_offset = 12;
+    slot = (struct ef_slot *)ef_execute(db, &cmd, &byte);
+    expect_true(slot != NULL, "EF_OP_WRITE_FIELD result");
+    cmd.opcode = EF_OP_GET_FIELD;
+    cmd.param = 20;
+    cmd.field_offset = 12;
+    expect_true(ef_execute(db, &cmd, NULL) != NULL, "EF_OP_GET_FIELD result");
+    expect_true(*(const uint8_t *)ef_execute(db, &cmd, NULL) == 0xCD,
+                "EF_OP_GET_FIELD reads back value");
+
+    err = ef_write_payload(db, 21, "A", 1);
+    expect_err(err, EF_OK, "chase_n execute write A");
+    err = ef_write_payload(db, 22, "B", 1);
+    expect_err(err, EF_OK, "chase_n execute write B");
+    err = ef_write_payload(db, 23, "C", 1);
+    expect_err(err, EF_OK, "chase_n execute write C");
+    off_a = ef_slot_to_offset(db, 21);
+    off_b = ef_slot_to_offset(db, 22);
+    off_c = ef_slot_to_offset(db, 23);
+    err = ef_set_next_offset(db, 21, off_b);
+    expect_err(err, EF_OK, "chase_n execute link A->B");
+    err = ef_set_next_offset(db, 22, off_c);
+    expect_err(err, EF_OK, "chase_n execute link B->C");
+
+    cmd.opcode = EF_OP_CHASE_N;
+    cmd.param = off_a;
+    cmd.field_offset = 2;
+    slot = (struct ef_slot *)ef_execute(db, &cmd, NULL);
+    expect_true(slot != NULL && slot->payload[0] == 'C', "EF_OP_CHASE_N result");
+    expect_true(cmd.field_offset == 2, "EF_OP_CHASE_N writes hops done");
+
+    cmd.field_offset = 10;
+    slot = (struct ef_slot *)ef_execute(db, &cmd, NULL);
+    expect_true(slot != NULL && slot->payload[0] == 'C', "EF_OP_CHASE_N short chain");
+    expect_true(cmd.field_offset == 3, "EF_OP_CHASE_N writes actual hops on short chain");
+}
+
 static void test_chase_loop(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
@@ -785,7 +847,7 @@ static void test_alloc_free(void)
     cmd.opcode = EF_OP_FREE;
     cmd.param = id_a;
     cmd.field_offset = 0;
-    expect_true(ef_execute(db, &cmd, NULL) == NULL, "EF_OP_FREE");
+    expect_true(ef_execute(db, &cmd, NULL) != NULL, "EF_OP_FREE");
     expect_err(ef_last_error(db), EF_OK, "EF_OP_FREE error code");
 
     cmd.opcode = EF_OP_ALLOC;
@@ -1223,6 +1285,7 @@ int main(void)
     test_offset_roundtrip(db);
     test_write_read_api(db);
     test_write_execute(db);
+    test_execute_get_slot_and_field(db);
     test_chase_loop(db);
     test_chase_n(db);
     test_error_paths(db);
