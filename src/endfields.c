@@ -389,7 +389,7 @@ static int ef_hash_capacity_valid(uint32_t hash_capacity)
     if (hash_capacity == 0) {
         return 1;
     }
-    if (hash_capacity > EF_INDEX_MAX_CAPACITY) {
+    if (hash_capacity > 0xFFFFU) {
         return 0;
     }
     return (hash_capacity & (hash_capacity - 1U)) == 0;
@@ -600,6 +600,7 @@ static void ef_init_slots(struct ef_db *db)
     memset(db->slots, 0, slots_bytes);
 }
 
+static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id);
 static struct ef_slot *ef_slot_at_offset(struct ef_db *db, uint64_t offset, uint64_t *slot_id_out);
 
 static enum ef_err ef_build_free_list(struct ef_db *db)
@@ -715,6 +716,39 @@ static enum ef_err ef_db_init_mapped(struct ef_db *db, int is_new_file, uint64_t
     return EF_OK;
 }
 
+static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id);
+
+static enum ef_err ef_claim_slot(struct ef_db *db, uint64_t slot_id)
+{
+    struct ef_slot *slot;
+    enum ef_err err;
+
+    slot = ef_peek_slot(db, slot_id);
+    if (slot == NULL) {
+        ef_set_error(db, EF_ERR_SLOT_ID);
+        return EF_ERR_SLOT_ID;
+    }
+
+    if (slot->status == EF_STATUS_USED) {
+        ef_set_error(db, EF_OK);
+        return EF_OK;
+    }
+
+    err = ef_unlink_free_slot(db, slot_id);
+    if (err != EF_OK) {
+        ef_set_error(db, err);
+        return err;
+    }
+
+    slot->status = EF_STATUS_USED;
+    if (ef_sb_free_count_load(db->sb) > 0) {
+        ef_sb_free_count_dec(db->sb);
+    }
+    ef_slot_header_crc_store(db, slot_id, slot);
+    ef_db_mark_meta_dirty(db);
+    ef_set_error(db, EF_OK);
+    return EF_OK;
+}
 
 const char *ef_strerror(enum ef_err err)
 {
@@ -1128,7 +1162,7 @@ static enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, st
     enum ef_err err;
 
     err = ef_index_remove_by_slot(db, slot_id);
-    if (err != EF_OK && err != EF_ERR_NULL_ARG) {
+    if (err != EF_OK) {
         ef_set_error(db, err);
         return err;
     }
@@ -1250,8 +1284,14 @@ enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, 
         return ef_last_error(db);
     }
     if (head->status == EF_STATUS_FREE) {
-        ef_set_error(db, EF_ERR_SLOT_FREE);
-        return EF_ERR_SLOT_FREE;
+        err = ef_claim_slot(db, slot_id);
+        if (err != EF_OK) {
+            return err;
+        }
+        head = ef_get_slot(db, slot_id);
+        if (head == NULL) {
+            return ef_last_error(db);
+        }
     }
     if (head->status != EF_STATUS_USED) {
         ef_set_error(db, EF_ERR_SLOT_BUSY);
@@ -1894,6 +1934,44 @@ void *ef_get_field_ptr(struct ef_slot *slot, uint8_t field_offset)
     return (uint8_t *)slot + field_offset;
 }
 
+static enum ef_err ef_unlink_free_slot(struct ef_db *db, uint64_t slot_id)
+{
+    struct ef_slot *slot;
+    struct ef_slot *cursor;
+    uint64_t slot_offset;
+    uint64_t guard;
+    uint64_t max_guard;
+
+    slot = ef_peek_slot(db, slot_id);
+    if (slot == NULL) {
+        return EF_ERR_SLOT_ID;
+    }
+    if (slot->status != EF_STATUS_FREE) {
+        return EF_OK;
+    }
+
+    slot_offset = ef_slot_to_offset(db, slot_id);
+    if (db->sb->free_list_head == slot_offset) {
+        db->sb->free_list_head = slot->next_offset;
+        slot->next_offset = 0;
+        return EF_OK;
+    }
+
+    cursor = ef_slot_at_offset(db, db->sb->free_list_head, NULL);
+    max_guard = db->sb->max_slots + 1U;
+    guard = 0;
+    while (cursor != NULL && guard < max_guard) {
+        ++guard;
+        if (cursor->next_offset == slot_offset) {
+            cursor->next_offset = slot->next_offset;
+            slot->next_offset = 0;
+            return EF_OK;
+        }
+        cursor = ef_slot_at_offset(db, cursor->next_offset, NULL);
+    }
+
+    return EF_ERR_NOT_FOUND;
+}
 
 enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
 {
@@ -1921,8 +1999,7 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
 
     if (status == EF_STATUS_USED) {
         if (slot->status == EF_STATUS_FREE) {
-            ef_set_error(db, EF_ERR_SLOT_FREE);
-            return EF_ERR_SLOT_FREE;
+            return ef_claim_slot(db, slot_id);
         }
         if (slot->status == EF_STATUS_USED) {
             ef_set_error(db, EF_OK);
@@ -1998,6 +2075,10 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
         ef_set_error(db, EF_ERR_NULL_ARG);
         return EF_ERR_NULL_ARG;
     }
+    if (len > EF_PAYLOAD_SIZE) {
+        ef_set_error(db, EF_ERR_PAYLOAD_LEN);
+        return EF_ERR_PAYLOAD_LEN;
+    }
 
     cap = ef_payload_capacity(db);
     if (len > cap) {
@@ -2012,8 +2093,11 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
     }
 
     if (slot->status == EF_STATUS_FREE) {
-        ef_set_error(db, EF_ERR_SLOT_FREE);
-        return EF_ERR_SLOT_FREE;
+        err = ef_claim_slot(db, slot_id);
+        if (err != EF_OK) {
+            return err;
+        }
+        slot = ef_peek_slot(db, slot_id);
     } else if (ef_slot_status_has_crc(slot->status)) {
         if (!ef_slot_header_crc_valid(db, slot_id, slot)) {
             ef_set_error(db, EF_ERR_BAD_CHECKSUM);
@@ -2536,6 +2620,7 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
     struct ef_slot *slot;
     const uint64_t *next_ptr;
     const uint32_t *status_ptr;
+    const uint32_t *hops_ptr;
     const uint8_t *byte_ptr;
     enum ef_err err;
 
@@ -2588,67 +2673,17 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
         return (err == EF_OK) ? ef_get_slot(db, *(const uint64_t *)aux) : NULL;
     case EF_OP_FREE:
         err = ef_free_slot(db, cmd->param);
-        return (err == EF_OK) ? ef_peek_slot(db, cmd->param) : NULL;
-    case EF_OP_CHASE_N: {
-        uint32_t hops_done = 0;
-        uint32_t hops;
+        return (err == EF_OK) ? NULL : NULL;
+    case EF_OP_CHASE_N:
         if (cmd->field_offset == 0) {
             if (aux == NULL) {
                 ef_set_error(db, EF_ERR_NULL_ARG);
-                cmd->field_offset = 0;
                 return NULL;
             }
-            hops = *(const uint32_t *)aux;
-        } else {
-            hops = cmd->field_offset;
+            hops_ptr = (const uint32_t *)aux;
+            return ef_chase_n(db, cmd->param, *hops_ptr, NULL);
         }
-        slot = ef_chase_n(db, cmd->param, hops, &hops_done);
-        cmd->field_offset = (uint8_t)hops_done;
-        return slot;
-    }
-    case EF_OP_QUEUE_PUSH:
-        if ((aux == NULL && cmd->field_offset != 0) || cmd->field_offset > 47) {
-            ef_set_error(db, EF_ERR_PAYLOAD_LEN);
-            return NULL;
-        }
-        err = ef_queue_push(db, aux, cmd->field_offset);
-        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
-    case EF_OP_QUEUE_POP: {
-        size_t n = 0;
-        if (aux == NULL) {
-            ef_set_error(db, EF_ERR_NULL_ARG);
-            return NULL;
-        }
-        err = ef_queue_pop(db, (void *)aux, cmd->field_offset, &n);
-        if (err != EF_OK) {
-            return NULL;
-        }
-        cmd->field_offset = (uint8_t)n;
-        return (void *)(uintptr_t)1;
-    }
-    case EF_OP_INDEX_PUT: {
-        const uint64_t *slot_id_in;
-        if (aux == NULL) {
-            ef_set_error(db, EF_ERR_NULL_ARG);
-            return NULL;
-        }
-        slot_id_in = (const uint64_t *)aux;
-        err = ef_index_put(db, (const char *)cmd->param, *slot_id_in);
-        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
-    }
-    case EF_OP_INDEX_GET: {
-        uint64_t *slot_id_out;
-        if (aux == NULL) {
-            ef_set_error(db, EF_ERR_NULL_ARG);
-            return NULL;
-        }
-        slot_id_out = (uint64_t *)aux;
-        err = ef_index_get(db, (const char *)cmd->param, slot_id_out);
-        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
-    }
-    case EF_OP_INDEX_REMOVE:
-        err = ef_index_remove(db, (const char *)cmd->param);
-        return (err == EF_OK) ? (void *)(uintptr_t)1 : NULL;
+        return ef_chase_n(db, cmd->param, cmd->field_offset, NULL);
     default:
         ef_set_error(db, EF_ERR_OPCODE);
         return NULL;

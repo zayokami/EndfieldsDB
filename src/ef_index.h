@@ -5,12 +5,11 @@
 
 #define EF_HASH_ENTRY_SIZE 16U
 
-/* Robin Hood load factor above which ef_index_put triggers an automatic rehash
- * to the next power-of-two capacity. */
+/* Robin Hood load factor above which ef_index_put triggers an automatic rehash to the
+ * next power-of-two capacity (bounded by EF_INDEX_MAX_CAPACITY). */
 #define EF_INDEX_REHASH_LOAD_FACTOR_NUM 3U
 #define EF_INDEX_REHASH_LOAD_FACTOR_DEN 4U
-/* The v4 superblock stores capacity in u16, while capacity must be a power of two. */
-#define EF_INDEX_MAX_CAPACITY 0x8000U
+#define EF_INDEX_MAX_CAPACITY 0xFFFFU
 
 #pragma pack(push, 1)
 struct ef_hash_entry {
@@ -25,8 +24,6 @@ uint64_t ef_key_hash(const char *key, size_t key_len);
 
 enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id);
 enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_out);
-enum ef_err ef_index_get_slot(struct ef_db *db, const char *key, struct ef_slot **slot_out,
-                              void *payload_buf, size_t buf_cap, size_t *payload_len_out);
 enum ef_err ef_index_remove(struct ef_db *db, const char *key);
 enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id);
 enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity);

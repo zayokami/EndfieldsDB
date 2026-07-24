@@ -28,11 +28,6 @@
 #define EF_OP_ALLOC         0x08U
 #define EF_OP_FREE          0x09U
 #define EF_OP_CHASE_N       0x0AU
-#define EF_OP_QUEUE_PUSH    0x0BU
-#define EF_OP_QUEUE_POP     0x0CU
-#define EF_OP_INDEX_PUT     0x0DU
-#define EF_OP_INDEX_GET     0x0EU
-#define EF_OP_INDEX_REMOVE  0x0FU
 
 #define EF_STATUS_FREE 0U
 #define EF_STATUS_USED 1U
@@ -68,18 +63,6 @@ struct ef_superblock {
     uint8_t reserved[28];
 };
 
-/* Opcode command envelope. The field_offset member is overloaded per opcode:
- *  - EF_OP_WRITE_PAYLOAD: payload length in bytes
- *  - EF_OP_CHASE_N: hop count when aux is NULL; when aux is non-NULL the hop
- *    count is read from aux and field_offset is overwritten with the actual
- *    number of hops performed on output (capped at 255)
- *  - EF_OP_GET_FIELD / EF_OP_WRITE_FIELD: byte offset into the slot payload
- *  - EF_OP_QUEUE_PUSH / EF_OP_QUEUE_POP: payload length in bytes
- *  - EF_OP_INDEX_PUT: cmd->param = key pointer; aux = pointer to uint64_t slot_id
- *  - EF_OP_INDEX_GET: cmd->param = key pointer; aux = pointer to uint64_t slot_id_out
- *  - EF_OP_INDEX_REMOVE: cmd->param = key pointer
- *  - For index opcodes, field_offset = key length in bytes (0 means strlen(key))
- */
 #pragma pack(push, 1)
 struct ef_cmd {
     uint8_t opcode;
@@ -141,6 +124,7 @@ struct ef_db {
     enum ef_backend backend;
     uint64_t slots_base;
     uint32_t hash_capacity;
+    uint32_t hash_entry_count; /* live entries in hash_index; maintained in-memory */
     struct ef_hash_entry *hash_index;
     int readonly;
     uint8_t sb_meta_dirty;

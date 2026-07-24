@@ -1,5 +1,5 @@
 # Build outputs
-/build*/
+/build/
 /out/
 /cmake-build-*/
 
@@ -34,13 +34,10 @@ _gcc_test.c
 # IDE & editor
 .vs/
 .vscode/
-.claude/
-.agents/
 .idea/
 *.swp
 *.swo
 *~
-CLAUDE.MD
 
 # OS
 .DS_Store
@@ -50,4 +47,3 @@ Desktop.ini
 # Logs
 *.log
 test_out*.txt
-bench-out.txt
