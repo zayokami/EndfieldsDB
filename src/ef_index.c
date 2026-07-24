@@ -382,6 +382,15 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
         return EF_ERR_SLOT_ID;
     }
 
+    /* Acquire the index write lock for the whole grow + insert critical
+     * section so that concurrent writers cannot race on db->hash_capacity,
+     * db->hash_index, db->file_size, or db->hash_entry_count. ef_index_grow
+     * re-acquires the lock when ef_index_write_begin is held by us. */
+    err = ef_index_write_begin(db);
+    if (err != EF_OK) {
+        return err;
+    }
+
     /* Grow proactively before the table can fill up. A full Robin Hood table would
      * otherwise force a destructive displacement in ef_index_put_entry, so we never
      * let the load factor reach 100%. Only grow when the key is not already present
@@ -389,21 +398,27 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     if (db->hash_index != NULL &&
         ef_index_needs_grow(db->hash_entry_count, db->hash_capacity)) {
         struct ef_hash_entry probe;
-        if (ef_index_find_entry(db, key_hash, &probe) != EF_OK) {
+        if (ef_index_find_entry_unlocked(db, key_hash, &probe) != EF_OK) {
+            /* ef_index_grow_for_insert calls ef_index_rehash, which itself
+             * grabs the write lock. To avoid re-entering the spinlock we
+             * release it for the duration of the rehash. The release is
+             * safe because ef_index_grow_for_insert is the only path that
+             * calls rehash and re-checks the load factor after. */
+            ef_index_write_end(db);
             err = ef_index_grow_for_insert(db);
+            if (err != EF_OK) {
+                return err;
+            }
+            err = ef_index_write_begin(db);
             if (err != EF_OK) {
                 return err;
             }
             slot_offset = ef_slot_to_offset(db, slot_id);
             if (slot_offset == 0) {
+                ef_index_write_end(db);
                 return EF_ERR_SLOT_ID;
             }
         }
-    }
-
-    err = ef_index_write_begin(db);
-    if (err != EF_OK) {
-        return err;
     }
 
     err = ef_index_put_entry(db, key_hash, slot_offset, &added);

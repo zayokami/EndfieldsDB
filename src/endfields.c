@@ -2163,6 +2163,9 @@ static enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, uns
 {
     enum ef_err err;
     const int clear_payload = (flags & EF_ALLOC_ZERO_PAYLOAD) != 0U;
+    const int has_seqlock = (db != NULL && db->sb != NULL &&
+                            db->sb->schema_version >= EF_SCHEMA_VERSION &&
+                            db->hash_capacity > 0U);
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -2173,41 +2176,71 @@ static enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, uns
         ef_set_error(db, EF_ERR_NULL_ARG);
         return EF_ERR_NULL_ARG;
     }
+
+    /* If the index uses a seqlock, grab it so that concurrent
+     * ef_index_rehash_to cannot memmove slots while we modify one.
+     * ef_index_grow_for_insert holds this same lock for the duration of
+     * the rehash. */
+    if (has_seqlock) {
+        err = ef_sb_index_write_lock_acquire(db->sb);
+        if (err != EF_OK) {
+            ef_set_error(db, err);
+            return err;
+        }
+    }
 #if EF_HAS_HW_ATOMICS
-    return ef_free_list_pop_atomic(db, slot_id_out, clear_payload);
+    err = ef_free_list_pop_atomic(db, slot_id_out, clear_payload);
+    if (has_seqlock) {
+        ef_sb_index_write_lock_release(db->sb);
+    }
+    return err;
 #else
-    struct ef_slot *slot;
-    uint64_t slot_id;
+    {
+        struct ef_slot *slot;
+        uint64_t slot_id;
 
-    if (db->sb->free_list_head == 0 || ef_sb_free_count_load(db->sb) == 0) {
-        ef_set_error(db, EF_ERR_SLOT_FULL);
-        return EF_ERR_SLOT_FULL;
+        if (db->sb->free_list_head == 0 || ef_sb_free_count_load(db->sb) == 0) {
+            ef_set_error(db, EF_ERR_SLOT_FULL);
+            if (has_seqlock) {
+                ef_sb_index_write_lock_release(db->sb);
+            }
+            return EF_ERR_SLOT_FULL;
+        }
+
+        slot = (struct ef_slot *)ef_offset_to_ptr(db, db->sb->free_list_head);
+        if (slot == NULL) {
+            if (has_seqlock) {
+                ef_sb_index_write_lock_release(db->sb);
+            }
+            return ef_last_error(db);
+        }
+
+        err = ef_offset_to_slot_id(db, db->sb->free_list_head, &slot_id);
+        if (err != EF_OK) {
+            ef_set_error(db, err);
+            if (has_seqlock) {
+                ef_sb_index_write_lock_release(db->sb);
+            }
+            return err;
+        }
+
+        db->sb->free_list_head = slot->next_offset;
+        slot->next_offset = 0;
+        slot->status = EF_STATUS_USED;
+        if (clear_payload) {
+            memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
+        }
+        ef_sb_free_count_dec(db->sb);
+        ef_slot_header_crc_store(db, slot_id, slot);
+        ef_db_mark_meta_dirty(db);
+
+        *slot_id_out = slot_id;
+        ef_set_error(db, EF_OK);
+        if (has_seqlock) {
+            ef_sb_index_write_lock_release(db->sb);
+        }
+        return EF_OK;
     }
-
-    slot = (struct ef_slot *)ef_offset_to_ptr(db, db->sb->free_list_head);
-    if (slot == NULL) {
-        return ef_last_error(db);
-    }
-
-    err = ef_offset_to_slot_id(db, db->sb->free_list_head, &slot_id);
-    if (err != EF_OK) {
-        ef_set_error(db, err);
-        return err;
-    }
-
-    db->sb->free_list_head = slot->next_offset;
-    slot->next_offset = 0;
-    slot->status = EF_STATUS_USED;
-    if (clear_payload) {
-        memset(ef_slot_payload_ptr(db, slot), 0, ef_payload_capacity(db));
-    }
-    ef_sb_free_count_dec(db->sb);
-    ef_slot_header_crc_store(db, slot_id, slot);
-    ef_db_mark_meta_dirty(db);
-
-    *slot_id_out = slot_id;
-    ef_set_error(db, EF_OK);
-    return EF_OK;
 #endif
 }
 
