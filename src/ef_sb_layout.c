@@ -56,9 +56,10 @@ uint32_t ef_sb_hash_capacity_load(const struct ef_superblock *sb)
     }
 
     if (ef_sb_uses_v4_index_layout(sb)) {
-        uint16_t cap16;
-
-        memcpy(&cap16, &sb->reserved[EF_SB_OFF_HASH_CAP_V4], sizeof(cap16));
+        /* Atomic 16-bit load to avoid racing with the lock-acquire CAS loop,
+         * which reads the 4-byte word that contains hash_capacity. */
+        uint16_t cap16 = ef_atomic_load_u16(
+            (const volatile void *)&sb->reserved[EF_SB_OFF_HASH_CAP_V4]);
         return (uint32_t)cap16;
     }
 
@@ -85,7 +86,29 @@ void ef_sb_hash_capacity_store(struct ef_superblock *sb, uint32_t hash_capacity)
     }
 
     cap16 = (uint16_t)hash_capacity;
-    memcpy(&sb->reserved[EF_SB_OFF_HASH_CAP_V4], &cap16, sizeof(cap16));
+
+    /* Use atomic 32-bit read-modify-write on the aligned word that contains
+     * hash_capacity. The index write lock byte and queue lock byte live in
+     * the same 4-byte word (sb->reserved[20..23]), and the lock-acquire
+     * CAS loop reads that word atomically. A plain 16-bit memcpy here would
+     * race with the CAS loop's atomic load in TSAN, and on 32-bit platforms
+     * the read-modify-write has to be atomic itself to avoid tearing the
+     * lock bytes. The caller is expected to hold the index write lock so
+     * the lock bytes remain stable for the duration of the RMW. */
+    if (ef_atomic_ptr_is_aligned(&sb->reserved[EF_SB_OFF_HASH_CAP_V4],
+                                 sizeof(uint32_t))) {
+        volatile uint32_t *word_ptr =
+            (volatile uint32_t *)&sb->reserved[EF_SB_OFF_HASH_CAP_V4];
+        uint32_t cur;
+        uint32_t next;
+
+        do {
+            cur = ef_atomic_load_u32((const volatile void *)word_ptr);
+            next = (cur & 0xFFFF0000U) | (uint32_t)cap16;
+        } while (!ef_atomic_cas_u32((volatile void *)word_ptr, &cur, next));
+    } else {
+        memcpy(&sb->reserved[EF_SB_OFF_HASH_CAP_V4], &cap16, sizeof(cap16));
+    }
 }
 
 enum ef_err ef_sb_migrate_v3_index_layout(struct ef_superblock *sb)

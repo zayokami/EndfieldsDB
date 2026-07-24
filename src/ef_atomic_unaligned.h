@@ -102,6 +102,32 @@ static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
     }
 }
 
+static inline void ef_atomic_store_u16(volatile void *ptr, uint16_t value)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint16_t))) {
+        __atomic_store_n((volatile uint16_t *)ptr, value, __ATOMIC_RELEASE);
+        return;
+    }
+
+    ef_atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static inline uint16_t ef_atomic_load_u16(const volatile void *ptr)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint16_t))) {
+        return __atomic_load_n((const volatile uint16_t *)ptr, __ATOMIC_ACQUIRE);
+    }
+
+    {
+        uint16_t value;
+
+        memcpy(&value, (const void *)ptr, sizeof(value));
+        ef_atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return value;
+    }
+}
+
 static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
 {
     if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
@@ -237,6 +263,36 @@ static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
     }
 }
 
+static inline void ef_atomic_store_u16(volatile void *ptr, uint16_t value)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint16_t))) {
+        *(volatile uint16_t *)ptr = value;
+        MemoryBarrier();
+        return;
+    }
+
+    MemoryBarrier();
+    memcpy((void *)ptr, (const void *)&value, sizeof(value));
+}
+
+static inline uint16_t ef_atomic_load_u16(const volatile void *ptr)
+{
+    if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint16_t))) {
+        uint16_t value = *(const volatile uint16_t *)ptr;
+
+        MemoryBarrier();
+        return value;
+    }
+
+    {
+        uint16_t value;
+
+        memcpy(&value, (const void *)ptr, sizeof(value));
+        MemoryBarrier();
+        return value;
+    }
+}
+
 static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
 {
     if (ef_atomic_ptr_is_aligned(ptr, sizeof(uint32_t))) {
@@ -303,6 +359,24 @@ static inline void ef_atomic_store_u32(volatile void *ptr, uint32_t value)
 static inline uint32_t ef_atomic_load_u32(const volatile void *ptr)
 {
     return *(const volatile uint32_t *)ptr;
+}
+
+static inline void ef_atomic_store_u16(volatile void *ptr, uint16_t value)
+{
+    uint16_t v;
+
+    EF_ATOMIC_THREAD_FENCE();
+    memcpy(&v, (const void *)&value, sizeof(v));
+    memcpy((void *)ptr, &v, sizeof(v));
+}
+
+static inline uint16_t ef_atomic_load_u16(const volatile void *ptr)
+{
+    uint16_t value;
+
+    memcpy(&value, (const void *)ptr, sizeof(value));
+    EF_ATOMIC_THREAD_FENCE();
+    return value;
 }
 
 static inline int ef_atomic_cas_u32(volatile void *ptr, uint32_t *expected, uint32_t desired)
