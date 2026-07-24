@@ -56,19 +56,10 @@ uint32_t ef_sb_hash_capacity_load(const struct ef_superblock *sb)
     }
 
     if (ef_sb_uses_v4_index_layout(sb)) {
-        /* Atomic 16-bit load to avoid racing with the lock-acquire CAS loop,
-         * which reads the 4-byte word that contains hash_capacity. */
-        if (ef_atomic_ptr_is_aligned(&sb->reserved[EF_SB_OFF_HASH_CAP_V4],
-                                     sizeof(uint16_t))) {
-            uint16_t cap16 = __atomic_load_n(
-                (const volatile uint16_t *)&sb->reserved[EF_SB_OFF_HASH_CAP_V4],
-                __ATOMIC_ACQUIRE);
-            return (uint32_t)cap16;
-        } else {
-            uint16_t cap16;
-            memcpy(&cap16, &sb->reserved[EF_SB_OFF_HASH_CAP_V4], sizeof(cap16));
-            return (uint32_t)cap16;
-        }
+        uint16_t cap16;
+
+        memcpy(&cap16, &sb->reserved[EF_SB_OFF_HASH_CAP_V4], sizeof(cap16));
+        return (uint32_t)cap16;
     }
 
     if (sb->schema_version >= EF_SCHEMA_VERSION_V3) {
@@ -94,24 +85,7 @@ void ef_sb_hash_capacity_store(struct ef_superblock *sb, uint32_t hash_capacity)
     }
 
     cap16 = (uint16_t)hash_capacity;
-
-    /* Use atomic 32-bit read-modify-write on the aligned word that contains
-     * hash_capacity. The index write lock and queue lock bytes live in the
-     * same word, so we must preserve them across the store. Writing via
-     * memcpy here would race with the lock-acquire CAS loop in another
-     * thread (TSAN flags it; the word may also tear on 32-bit platforms).
-     * The store is expected to be called with the index write lock held so
-     * the lock bytes remain stable for the duration of the RMW. */
-    if (ef_atomic_ptr_is_aligned(&sb->reserved[EF_SB_OFF_HASH_CAP_V4],
-                                 sizeof(uint32_t))) {
-        volatile uint32_t *word =
-            (volatile uint32_t *)&sb->reserved[EF_SB_OFF_HASH_CAP_V4];
-        uint32_t cur = ef_atomic_load_u32((const volatile void *)word);
-        uint32_t next = (cur & 0xFFFF0000U) | (uint32_t)cap16;
-        ef_atomic_store_u32((volatile void *)word, next);
-    } else {
-        memcpy(&sb->reserved[EF_SB_OFF_HASH_CAP_V4], &cap16, sizeof(cap16));
-    }
+    memcpy(&sb->reserved[EF_SB_OFF_HASH_CAP_V4], &cap16, sizeof(cap16));
 }
 
 enum ef_err ef_sb_migrate_v3_index_layout(struct ef_superblock *sb)

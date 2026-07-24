@@ -98,8 +98,12 @@ static void ef_index_bind_layout(struct ef_db *db)
 
 static int ef_index_has_seqlock(const struct ef_db *db)
 {
-    return db != NULL && db->sb != NULL && db->sb->schema_version >= EF_SCHEMA_VERSION &&
-           db->hash_capacity > 0U;
+    /* The seqlock is purely a function of the on-disk schema, so this is
+     * safe to call without holding any lock. We deliberately do NOT look
+     * at db->hash_capacity here: that field is rewritten by
+     * ef_index_bind_layout during rehash, and reading it from the
+     * lock-acquire fast path would race with bind_layout. */
+    return db != NULL && db->sb != NULL && db->sb->schema_version >= EF_SCHEMA_VERSION;
 }
 
 static uint64_t ef_index_fixup_offset(uint64_t offset, uint64_t old_base, uint64_t new_base)
@@ -531,7 +535,7 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
 {
     enum ef_err err;
 
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0 || key == NULL) {
+    if (db == NULL || key == NULL) {
         return EF_ERR_NULL_ARG;
     }
 
@@ -543,6 +547,13 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
     err = ef_index_write_begin(db);
     if (err != EF_OK) {
         return err;
+    }
+
+    /* db->hash_index and db->hash_capacity are rewritten by
+     * ef_index_bind_layout during rehash; read them under the lock. */
+    if (db->hash_index == NULL || db->hash_capacity == 0) {
+        ef_index_write_end(db);
+        return EF_ERR_NULL_ARG;
     }
 
     err = ef_index_remove_by_hash(db, ef_key_hash(key, strlen(key)));
@@ -657,29 +668,76 @@ static enum ef_err ef_index_rehash_to(struct ef_db *db, uint32_t new_capacity, i
         return err;
     }
 
-    old_capacity = db->hash_capacity;
-    if (old_capacity == 0 || db->hash_index == NULL) {
-        return EF_ERR_NULL_ARG;
-    }
-
-    shrinking = (allow_shrink != 0 && new_capacity < old_capacity) ? 1 : 0;
-
     if (new_capacity < 1U || (new_capacity & (new_capacity - 1U)) != 0) {
         return EF_ERR_GROW;
     }
     if (new_capacity > 0xFFFFU) {
         return EF_ERR_GROW;
     }
-    if (!shrinking && new_capacity <= old_capacity) {
-        return EF_ERR_GROW;
-    }
-    if (shrinking && db->backend == EF_BACKEND_FILE) {
-        return EF_ERR_GROW;
-    }
 
+    /* Acquire the write lock BEFORE reading db->hash_capacity and
+     * db->hash_index: those fields are rewritten by ef_index_bind_layout
+     * during rehash, and reading them outside the lock would race with a
+     * concurrent rehash's bind_layout. We do the shrinking/backend checks
+     * after the lock is held where they can safely observe db->hash_capacity. */
     err = ef_index_write_begin(db);
     if (err != EF_OK) {
         return err;
+    }
+
+    old_capacity = db->hash_capacity;
+    if (old_capacity == 0 || db->hash_index == NULL) {
+        ef_index_write_end(db);
+        return EF_ERR_NULL_ARG;
+    }
+
+    /* allow_shrink = 1  -> only shrinking is allowed (new_capacity < old_capacity).
+     * allow_shrink = 0  -> growing or no-op (any new_capacity is OK as long as
+     *                      it's not a shrink, which would be a programming bug).
+     * The any-growth-direction tolerance handles the race where
+     * ef_index_grow_for_insert's snapshot of old_capacity becomes stale
+     * because a concurrent rehash already grew the table past the target
+     * we computed; re-hashing to a smaller-than-current size is a harmless
+     * no-op because the live entries already fit in the larger table. */
+    if (allow_shrink != 0) {
+        if (new_capacity >= old_capacity) {
+            ef_index_write_end(db);
+            return EF_ERR_GROW;
+        }
+        shrinking = 1;
+    } else {
+        if (new_capacity == 0U || (new_capacity & (new_capacity - 1U)) != 0) {
+            ef_index_write_end(db);
+            return EF_ERR_GROW;
+        }
+        if (new_capacity < old_capacity) {
+            /* Concurrent rehash already grew past us; nothing to do. */
+            ef_index_write_end(db);
+            return EF_OK;
+        }
+        shrinking = 0;
+    }
+    if (new_capacity == old_capacity) {
+        /* No-op: nothing to do. */
+        ef_index_write_end(db);
+        return EF_OK;
+    }
+    if (shrinking && db->backend == EF_BACKEND_FILE) {
+        ef_index_write_end(db);
+        return EF_ERR_GROW;
+    }
+    if (shrinking && db->hash_entry_count != 0U) {
+        /* Reject shrinking below what the live entries can fit at 3/4 load.
+         * Done under the lock so we observe db->hash_entry_count
+         * consistently with bind_layout's updates. */
+        const uint64_t lhs = (uint64_t)db->hash_entry_count *
+                             EF_INDEX_REHASH_LOAD_FACTOR_DEN;
+        const uint64_t rhs = (uint64_t)new_capacity *
+                             EF_INDEX_REHASH_LOAD_FACTOR_NUM;
+        if (lhs >= rhs) {
+            ef_index_write_end(db);
+            return EF_ERR_GROW;
+        }
     }
 
     for (i = 0; i < old_capacity; ++i) {
@@ -975,24 +1033,16 @@ uint32_t ef_index_pick_shrink_capacity(uint32_t entries, uint32_t current_capaci
 
 enum ef_err ef_index_shrink(struct ef_db *db, uint32_t new_capacity)
 {
-    uint32_t old_capacity;
-
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
-        return EF_ERR_NULL_ARG;
-    }
-    old_capacity = db->hash_capacity;
-    if (new_capacity == 0U || new_capacity >= old_capacity) {
+    /* All shrinking checks against db->hash_capacity / db->hash_entry_count
+     * (zero capacity, new_capacity < old_capacity, load-factor fit,
+     * file-backend rejection) are performed inside ef_index_rehash_to under
+     * the index write lock. We deliberately do NOT read db->hash_capacity /
+     * db->hash_entry_count here: those fields are rewritten by
+     * ef_index_bind_layout during rehash, and reading them outside the lock
+     * would race with a concurrent rehash. The new_capacity == 0 guard stays
+     * here because it's a pure constant. */
+    if (new_capacity == 0U) {
         return EF_ERR_GROW;
-    }
-    /* Reject shrinking below what the live entries can fit at 3/4 load. */
-    if (db->hash_entry_count != 0U) {
-        const uint64_t lhs = (uint64_t)db->hash_entry_count *
-                             EF_INDEX_REHASH_LOAD_FACTOR_DEN;
-        const uint64_t rhs = (uint64_t)new_capacity *
-                             EF_INDEX_REHASH_LOAD_FACTOR_NUM;
-        if (lhs >= rhs) {
-            return EF_ERR_GROW;
-        }
     }
     return ef_index_rehash_to(db, new_capacity, 1);
 }
