@@ -2164,8 +2164,7 @@ static enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, uns
     enum ef_err err;
     const int clear_payload = (flags & EF_ALLOC_ZERO_PAYLOAD) != 0U;
     const int has_seqlock = (db != NULL && db->sb != NULL &&
-                            db->sb->schema_version >= EF_SCHEMA_VERSION &&
-                            db->hash_capacity > 0U);
+                            db->sb->schema_version >= EF_SCHEMA_VERSION);
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -2180,7 +2179,10 @@ static enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, uns
     /* If the index uses a seqlock, grab it so that concurrent
      * ef_index_rehash_to cannot memmove slots while we modify one.
      * ef_index_grow_for_insert holds this same lock for the duration of
-     * the rehash. */
+     * the rehash. We determine whether the seqlock is needed from
+     * schema_version only (schema_version itself is stable after open);
+     * the index layout may have hash_capacity == 0 in which case rehash
+     * never runs and the lock is a cheap no-op. */
     if (has_seqlock) {
         err = ef_sb_index_write_lock_acquire(db->sb);
         if (err != EF_OK) {

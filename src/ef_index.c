@@ -19,7 +19,8 @@
 
 static int ef_hash_entry_empty(const struct ef_hash_entry *entry);
 
-static int ef_index_should_shrink(const struct ef_db *db);
+static int ef_index_should_shrink_snap(const struct ef_db *db, uint32_t entries,
+                                       uint32_t capacity);
 
 static int ef_hash_entry_empty_atomic(const struct ef_hash_entry *entry)
 {
@@ -377,18 +378,22 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     }
 
     key_hash = ef_key_hash(key, strlen(key));
-    slot_offset = ef_slot_to_offset(db, slot_id);
-    if (slot_offset == 0) {
-        return EF_ERR_SLOT_ID;
-    }
 
     /* Acquire the index write lock for the whole grow + insert critical
      * section so that concurrent writers cannot race on db->hash_capacity,
-     * db->hash_index, db->file_size, or db->hash_entry_count. ef_index_grow
-     * re-acquires the lock when ef_index_write_begin is held by us. */
+     * db->hash_index, db->file_size, db->slots_base, or db->hash_entry_count.
+     * ef_index_grow re-acquires the lock when ef_index_write_begin is held
+     * by us, so we must read slot_offset (which reads db->slots_base) under
+     * the lock to avoid racing with ef_index_bind_layout's update. */
     err = ef_index_write_begin(db);
     if (err != EF_OK) {
         return err;
+    }
+
+    slot_offset = ef_slot_to_offset(db, slot_id);
+    if (slot_offset == 0) {
+        ef_index_write_end(db);
+        return EF_ERR_SLOT_ID;
     }
 
     /* Grow proactively before the table can fill up. A full Robin Hood table would
@@ -422,11 +427,11 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     }
 
     err = ef_index_put_entry(db, key_hash, slot_offset, &added);
+    if (err == EF_OK && added) {
+        ++db->hash_entry_count;
+    }
     ef_index_write_end(db);
     if (err == EF_OK) {
-        if (added) {
-            ++db->hash_entry_count;
-        }
         ef_db_mark_meta_dirty(db);
     }
     return err;
@@ -541,13 +546,21 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
     }
 
     err = ef_index_remove_by_hash(db, ef_key_hash(key, strlen(key)));
-    ef_index_write_end(db);
     if (err == EF_OK) {
+        /* Snapshot the shrink inputs under the lock so we don't race with
+         * concurrent writers updating db->hash_capacity or db->hash_entry_count.
+         * The actual shrink (ef_index_shrink -> ef_index_rehash_to) runs after
+         * we drop the lock, since it acquires the lock itself and would
+         * deadlock if called while we still hold it. */
+        uint32_t entries = db->hash_entry_count;
+        uint32_t capacity = db->hash_capacity;
+        ef_index_write_end(db);
         ef_db_mark_meta_dirty(db);
-        if (ef_index_should_shrink(db)) {
-            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(db->hash_entry_count,
-                                                                     db->hash_capacity));
+        if (ef_index_should_shrink_snap(db, entries, capacity)) {
+            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(entries, capacity));
         }
+    } else {
+        ef_index_write_end(db);
     }
     return err;
 }
@@ -558,7 +571,7 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
     uint64_t slot_offset;
     enum ef_err err;
 
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+    if (db == NULL) {
         return EF_OK;
     }
 
@@ -567,14 +580,20 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
         return err;
     }
 
-    slot_offset = ef_slot_to_offset(db, slot_id);
-    if (slot_offset == 0) {
-        return EF_OK;
-    }
-
     err = ef_index_write_begin(db);
     if (err != EF_OK) {
         return err;
+    }
+
+    if (db->hash_index == NULL || db->hash_capacity == 0) {
+        ef_index_write_end(db);
+        return EF_OK;
+    }
+
+    slot_offset = ef_slot_to_offset(db, slot_id);
+    if (slot_offset == 0) {
+        ef_index_write_end(db);
+        return EF_OK;
     }
 
     for (i = 0; i < db->hash_capacity; ++i) {
@@ -590,13 +609,21 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
         }
     }
 
-    ef_index_write_end(db);
     if (err == EF_OK) {
+        /* Snapshot the shrink inputs under the lock so we don't race with
+         * concurrent writers updating db->hash_capacity or db->hash_entry_count.
+         * The actual shrink (ef_index_shrink -> ef_index_rehash_to) runs after
+         * we drop the lock, since it acquires the lock itself and would
+         * deadlock if called while we still hold it. */
+        uint32_t entries = db->hash_entry_count;
+        uint32_t capacity = db->hash_capacity;
+        ef_index_write_end(db);
         ef_db_mark_meta_dirty(db);
-        if (ef_index_should_shrink(db)) {
-            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(db->hash_entry_count,
-                                                                     db->hash_capacity));
+        if (ef_index_should_shrink_snap(db, entries, capacity)) {
+            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(entries, capacity));
         }
+    } else {
+        ef_index_write_end(db);
     }
     return err;
 }
@@ -751,7 +778,7 @@ enum ef_err ef_index_clear(struct ef_db *db)
 {
     enum ef_err err;
 
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+    if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
 
@@ -765,12 +792,27 @@ enum ef_err ef_index_clear(struct ef_db *db)
         return err;
     }
 
+    /* db->hash_index and db->hash_capacity are rewritten by
+     * ef_index_bind_layout during rehash; read them under the lock. */
+    if (db->hash_index == NULL || db->hash_capacity == 0) {
+        ef_index_write_end(db);
+        return EF_ERR_NULL_ARG;
+    }
+
     memset(db->hash_index, 0, (size_t)db->hash_capacity * sizeof(struct ef_hash_entry));
     db->hash_entry_count = 0U;
     ef_db_mark_meta_dirty(db);
-    ef_index_write_end(db);
+    /* Snapshot the shrink inputs under the lock so we don't race with
+     * concurrent writers updating db->hash_capacity. The actual shrink
+     * (ef_index_shrink -> ef_index_rehash_to) runs after we drop the lock,
+     * since it acquires the lock itself and would deadlock if called while
+     * we still hold it. */
     if (db->hash_capacity > EF_DEFAULT_HASH_MIN) {
-        (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(0U, db->hash_capacity));
+        uint32_t capacity = db->hash_capacity;
+        ef_index_write_end(db);
+        (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(0U, capacity));
+    } else {
+        ef_index_write_end(db);
     }
     return EF_OK;
 }
@@ -820,18 +862,35 @@ static uint32_t ef_index_pick_capacity(uint32_t entries, uint32_t min_capacity)
 }
 
 /* Grow the index so it can absorb one more entry without exceeding the load-factor
- * threshold. Must be called with no write lock held (ef_index_rehash takes its own). */
+ * threshold. This function takes the index write lock for the preliminary reads of
+ * db->hash_capacity, db->hash_index, and db->hash_entry_count (which are concurrently
+ * rewritten by ef_index_bind_layout during rehash), then releases it before calling
+ * ef_index_rehash, which re-acquires the lock for the actual rehash critical
+ * section. ef_index_rehash expects the lock to be free on entry. */
 static enum ef_err ef_index_grow_for_insert(struct ef_db *db)
 {
     uint32_t cap;
     uint32_t target;
+    enum ef_err err;
 
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+    if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
 
+    /* Read db->hash_capacity, db->hash_index, and db->hash_entry_count under
+     * the lock so we cannot race with ef_index_bind_layout's writes. */
+    err = ef_index_write_begin(db);
+    if (err != EF_OK) {
+        return err;
+    }
+    if (db->hash_index == NULL || db->hash_capacity == 0) {
+        ef_index_write_end(db);
+        return EF_ERR_NULL_ARG;
+    }
     cap = db->hash_capacity;
     target = ef_index_pick_capacity(db->hash_entry_count + 1U, cap << 1U);
+    ef_index_write_end(db);
+
     if (target == 0U || target <= cap) {
         return EF_ERR_INDEX_FULL;
     }
@@ -839,18 +898,20 @@ static enum ef_err ef_index_grow_for_insert(struct ef_db *db)
     return ef_index_rehash(db, target);
 }
 
-/* Returns 1 if the live entry count is below the shrink threshold. */
-static int ef_index_should_shrink(const struct ef_db *db)
+/* Snapshot variant that accepts the entries/capacity values to check. Used by
+ * callers that need to make the shrink decision after releasing the index write
+ * lock (since ef_index_shrink itself re-acquires the lock via rehash). */
+static int ef_index_should_shrink_snap(const struct ef_db *db, uint32_t entries,
+                                       uint32_t capacity)
 {
-    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+    if (db == NULL || db->hash_index == NULL || capacity == 0) {
         return 0;
     }
-    if (db->hash_entry_count == 0U) {
-        /* Drop to the minimum capacity rather than starve the table. */
+    if (entries == 0U) {
         return 1;
     }
-    return (uint64_t)db->hash_entry_count * EF_INDEX_SHRINK_LOAD_FACTOR_DEN <
-           (uint64_t)db->hash_capacity * EF_INDEX_SHRINK_LOAD_FACTOR_NUM;
+    return (uint64_t)entries * EF_INDEX_SHRINK_LOAD_FACTOR_DEN <
+           (uint64_t)capacity * EF_INDEX_SHRINK_LOAD_FACTOR_NUM;
 }
 
 uint32_t ef_index_pick_shrink_capacity(uint32_t entries, uint32_t current_capacity)
