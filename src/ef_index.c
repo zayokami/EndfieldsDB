@@ -19,6 +19,8 @@
 
 static int ef_hash_entry_empty(const struct ef_hash_entry *entry);
 
+static int ef_index_should_shrink(const struct ef_db *db);
+
 static int ef_hash_entry_empty_atomic(const struct ef_hash_entry *entry)
 {
     return ef_atomic_load_u64((const void *)&entry->slot_offset) == 0ULL;
@@ -231,6 +233,7 @@ static enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint6
     uint32_t i;
     struct ef_hash_entry incoming;
     struct ef_hash_entry outgoing;
+    uint32_t full_count = 0;
 
     if (added_out != NULL) {
         *added_out = 0;
@@ -262,6 +265,7 @@ static enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint6
             }
             return EF_OK;
         }
+        ++full_count;
 
         if (cur.key_hash == key_hash) {
             ef_hash_entry_store_atomic(entry, key_hash, slot_offset);
@@ -278,6 +282,7 @@ static enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint6
         }
     }
 
+    (void)full_count;
     return EF_ERR_INDEX_FULL;
 }
 
@@ -411,7 +416,6 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     }
     return err;
 }
-
 enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_out)
 {
     struct ef_hash_entry found;
@@ -525,6 +529,10 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
     ef_index_write_end(db);
     if (err == EF_OK) {
         ef_db_mark_meta_dirty(db);
+        if (ef_index_should_shrink(db)) {
+            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(db->hash_entry_count,
+                                                                     db->hash_capacity));
+        }
     }
     return err;
 }
@@ -570,11 +578,19 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id)
     ef_index_write_end(db);
     if (err == EF_OK) {
         ef_db_mark_meta_dirty(db);
+        if (ef_index_should_shrink(db)) {
+            (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(db->hash_entry_count,
+                                                                     db->hash_capacity));
+        }
     }
     return err;
 }
 
-enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
+/* Internal rehash shared by ef_index_rehash (grow-only) and ef_index_shrink.
+ * When allow_shrink is 0 new_capacity must be > old_capacity; when 1 it may be smaller.
+ * On file backend shrink is rejected with EF_ERR_GROW because truncate+remap is not
+ * implemented in ef_port_grow_file; memory backend can shrink freely. */
+static enum ef_err ef_index_rehash_to(struct ef_db *db, uint32_t new_capacity, int allow_shrink)
 {
     struct ef_hash_entry *backup = NULL;
     uint32_t old_capacity;
@@ -585,6 +601,7 @@ enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
     size_t new_size;
     size_t slot_bytes;
     enum ef_err err;
+    int shrinking;
 #if EF_HAS_FILE_IO
     struct ef_io io;
 #endif
@@ -602,10 +619,19 @@ enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
     if (old_capacity == 0 || db->hash_index == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    if (new_capacity <= old_capacity || (new_capacity & (new_capacity - 1U)) != 0) {
+
+    shrinking = (allow_shrink != 0 && new_capacity < old_capacity) ? 1 : 0;
+
+    if (new_capacity < 1U || (new_capacity & (new_capacity - 1U)) != 0) {
         return EF_ERR_GROW;
     }
     if (new_capacity > 0xFFFFU) {
+        return EF_ERR_GROW;
+    }
+    if (!shrinking && new_capacity <= old_capacity) {
+        return EF_ERR_GROW;
+    }
+    if (shrinking && db->backend == EF_BACKEND_FILE) {
         return EF_ERR_GROW;
     }
 
@@ -701,6 +727,11 @@ enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
     return EF_OK;
 }
 
+enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity)
+{
+    return ef_index_rehash_to(db, new_capacity, 0);
+}
+
 enum ef_err ef_index_clear(struct ef_db *db)
 {
     enum ef_err err;
@@ -723,6 +754,9 @@ enum ef_err ef_index_clear(struct ef_db *db)
     db->hash_entry_count = 0U;
     ef_db_mark_meta_dirty(db);
     ef_index_write_end(db);
+    if (db->hash_capacity > EF_DEFAULT_HASH_MIN) {
+        (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(0U, db->hash_capacity));
+    }
     return EF_OK;
 }
 
@@ -788,4 +822,160 @@ static enum ef_err ef_index_grow_for_insert(struct ef_db *db)
     }
 
     return ef_index_rehash(db, target);
+}
+
+/* Returns 1 if the live entry count is below the shrink threshold. */
+static int ef_index_should_shrink(const struct ef_db *db)
+{
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+        return 0;
+    }
+    if (db->hash_entry_count == 0U) {
+        /* Drop to the minimum capacity rather than starve the table. */
+        return 1;
+    }
+    return (uint64_t)db->hash_entry_count * EF_INDEX_SHRINK_LOAD_FACTOR_DEN <
+           (uint64_t)db->hash_capacity * EF_INDEX_SHRINK_LOAD_FACTOR_NUM;
+}
+
+uint32_t ef_index_pick_shrink_capacity(uint32_t entries, uint32_t current_capacity)
+{
+    uint32_t cap;
+    uint32_t min_capacity;
+    uint32_t min_required;
+
+    if (current_capacity == 0U || (current_capacity & (current_capacity - 1U)) != 0U) {
+        return 0U;
+    }
+    if (current_capacity > 0xFFFFU) {
+        return 0U;
+    }
+
+    /* The shrunken capacity must keep the rehash load factor satisfied
+     * (entries <= capacity * 3/4), otherwise Robin Hood reinsertion will
+     * fail with EF_ERR_INDEX_FULL. */
+    if (entries > 0U) {
+        min_required = entries * EF_INDEX_REHASH_LOAD_FACTOR_DEN /
+                       EF_INDEX_REHASH_LOAD_FACTOR_NUM;
+        if (entries * EF_INDEX_REHASH_LOAD_FACTOR_DEN >
+            min_required * EF_INDEX_REHASH_LOAD_FACTOR_NUM) {
+            ++min_required;
+        }
+        /* Round up to next power of two. */
+        cap = EF_DEFAULT_HASH_MIN;
+        while (cap < min_required) {
+            cap <<= 1U;
+        }
+        if (cap >= current_capacity) {
+            return 0U;
+        }
+    } else {
+        cap = EF_DEFAULT_HASH_MIN;
+        if (cap >= current_capacity) {
+            return 0U;
+        }
+    }
+
+    /* Only shrink if we are below the shrink threshold. */
+    if (entries != 0U &&
+        (uint64_t)entries * EF_INDEX_SHRINK_LOAD_FACTOR_DEN >=
+            (uint64_t)current_capacity * EF_INDEX_SHRINK_LOAD_FACTOR_NUM) {
+        return 0U;
+    }
+
+    min_capacity = EF_DEFAULT_HASH_MIN;
+    while (cap > min_capacity) {
+        if (entries == 0U) {
+            return cap;
+        }
+        if ((uint64_t)cap * EF_INDEX_SHRINK_LOAD_FACTOR_DEN >=
+            (uint64_t)entries * EF_INDEX_SHRINK_LOAD_FACTOR_NUM) {
+            return cap;
+        }
+        cap >>= 1U;
+    }
+    return min_capacity;
+}
+
+enum ef_err ef_index_shrink(struct ef_db *db, uint32_t new_capacity)
+{
+    uint32_t old_capacity;
+
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0) {
+        return EF_ERR_NULL_ARG;
+    }
+    old_capacity = db->hash_capacity;
+    if (new_capacity == 0U || new_capacity >= old_capacity) {
+        return EF_ERR_GROW;
+    }
+    /* Reject shrinking below what the live entries can fit at 3/4 load. */
+    if (db->hash_entry_count != 0U) {
+        const uint64_t lhs = (uint64_t)db->hash_entry_count *
+                             EF_INDEX_REHASH_LOAD_FACTOR_DEN;
+        const uint64_t rhs = (uint64_t)new_capacity *
+                             EF_INDEX_REHASH_LOAD_FACTOR_NUM;
+        if (lhs >= rhs) {
+            return EF_ERR_GROW;
+        }
+    }
+    return ef_index_rehash_to(db, new_capacity, 1);
+}
+
+static enum ef_err ef_index_iterate_impl(const struct ef_db *db, ef_index_iter_fn cb, void *user,
+                                         int stop_on_writer)
+{
+    uint32_t capacity;
+    uint32_t i;
+    uint32_t prev_seq = 0U;
+    int watching_seq = 0;
+
+    if (db == NULL || cb == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    if (db->hash_index == NULL || db->hash_capacity == 0) {
+        return EF_OK;
+    }
+
+    capacity = db->hash_capacity;
+    if (stop_on_writer && ef_index_has_seqlock(db)) {
+        prev_seq = ef_sb_index_seq_load(db->sb);
+        watching_seq = 1;
+    }
+
+    for (i = 0; i < capacity; ++i) {
+        struct ef_hash_entry cur;
+        int rc;
+
+        ef_hash_entry_load_atomic(&db->hash_index[i], &cur);
+        if (ef_hash_entry_empty_atomic(&db->hash_index[i])) {
+            continue;
+        }
+
+        if (stop_on_writer && watching_seq) {
+            uint32_t now_seq = ef_sb_index_seq_load(db->sb);
+            if (now_seq != prev_seq) {
+                return EF_ERR_INDEX_BUSY;
+            }
+        }
+
+        rc = cb(user, cur.key_hash, cur.slot_offset);
+        if (rc == 1) {
+            return EF_OK;
+        }
+        if (rc != 0) {
+            return EF_ERR_USER_ABORT;
+        }
+    }
+
+    return EF_OK;
+}
+
+enum ef_err ef_index_iterate(struct ef_db *db, ef_index_iter_fn cb, void *user)
+{
+    return ef_index_iterate_impl(db, cb, user, 0);
+}
+
+enum ef_err ef_index_iterate_until(struct ef_db *db, ef_index_iter_fn cb, void *user)
+{
+    return ef_index_iterate_impl(db, cb, user, 1);
 }

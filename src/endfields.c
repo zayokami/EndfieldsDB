@@ -779,6 +779,7 @@ const char *ef_strerror(enum ef_err err)
     case EF_ERR_QUEUE_BUSY: return "queue contended too long";
     case EF_ERR_INDEX_FULL: return "hash index is full";
     case EF_ERR_INDEX_BUSY: return "hash index lock busy";
+    case EF_ERR_USER_ABORT: return "user callback aborted";
     default: return "unknown error";
     }
 }

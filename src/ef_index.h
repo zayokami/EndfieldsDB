@@ -9,6 +9,10 @@
  * next power-of-two capacity (bounded by EF_INDEX_MAX_CAPACITY). */
 #define EF_INDEX_REHASH_LOAD_FACTOR_NUM 3U
 #define EF_INDEX_REHASH_LOAD_FACTOR_DEN 4U
+/* When the entry count drops below this load factor, an automatic shrink is triggered
+ * to the next power-of-two capacity that fits the live entries. */
+#define EF_INDEX_SHRINK_LOAD_FACTOR_NUM 1U
+#define EF_INDEX_SHRINK_LOAD_FACTOR_DEN 8U
 #define EF_INDEX_MAX_CAPACITY 0xFFFFU
 
 #pragma pack(push, 1)
@@ -27,7 +31,16 @@ enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_ou
 enum ef_err ef_index_remove(struct ef_db *db, const char *key);
 enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id);
 enum ef_err ef_index_rehash(struct ef_db *db, uint32_t new_capacity);
+enum ef_err ef_index_shrink(struct ef_db *db, uint32_t new_capacity);
+uint32_t ef_index_pick_shrink_capacity(uint32_t entries, uint32_t current_capacity);
 enum ef_err ef_index_clear(struct ef_db *db);
+
+/* Callback for ef_index_iterate*; return 0 to continue, 1 to stop, anything else
+ * to abort with EF_ERR_USER_ABORT. */
+typedef int (*ef_index_iter_fn)(void *user, uint64_t key_hash, uint64_t slot_id);
+
+enum ef_err ef_index_iterate(struct ef_db *db, ef_index_iter_fn cb, void *user);
+enum ef_err ef_index_iterate_until(struct ef_db *db, ef_index_iter_fn cb, void *user);
 
 /* Current index capacity (0 if index disabled). */
 uint32_t ef_index_capacity(const struct ef_db *db);
