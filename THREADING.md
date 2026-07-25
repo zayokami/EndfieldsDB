@@ -128,14 +128,15 @@ for (;;) {
 
 | 平台 | 多线程测试 |
 |------|------------|
-| Windows | `test_queue_mpmc`、`test_index_mrsr`（Win32 线程） |
-| Linux / macOS 等 | `test_queue_mpmc`、`test_index_mrsr`（pthread） |
+| Windows | `test_queue_mpmc`、`test_index_mrsr`、`test_index_multi_writer`、`test_index_multi_writer_rehash`（Win32 线程） |
+| Linux / macOS 等 | `test_queue_mpmc`、`test_index_mrsr`、`test_index_multi_writer`、`test_index_multi_writer_rehash`（pthread） |
 | 嵌入式 `EF_PLATFORM_EMBEDDED` | 跳过（无文件 I/O） |
 
 构建非 Windows 测试时需链接 pthread（CMake `Threads::Threads`）。
 
+CI 矩阵对每种组合运行 Linux GCC Release / Debug / no-prefetch / ASan+UBSan / TSan、Linux Clang Release、macOS Clang Release、Windows MSVC Release、Windows MinGW Release+Debug、Linux embedded-only、Linux clang-tidy+cppcheck 静态分析；所有 job 启用 `-Werror`（`ENDFIELDS_WARNINGS_AS_ERRORS=ON`）。
+
 ## 后续计划（未实现）
 
-- 槽位读侧与索引读的原子组合 API
-- `ef_execute` 队列/索引操作码
-- 自动 `ef_index_rehash` 阈值
+- 槽位读侧与索引读的原子组合 API：仍由调用方负责在 index read 返回 `slot_id` 后到访问槽位 payload 期间不发生写者修改该槽，或使用外部互斥。
+- `ef_execute` 队列/索引操作码：见 `ef_execute` 当前只覆盖 get slot、chase、field read/write、payload write、set next/status、alloc/free、chase_n；索引和队列的高层操作尚未派发。

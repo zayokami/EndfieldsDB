@@ -95,8 +95,3 @@ uint32_t ef_crc32(const void *data, size_t len)
 {
     return ef_crc32_update(0xFFFFFFFFU, data, len) ^ 0xFFFFFFFFU;
 }
-
-uint32_t ef_crc32_combine(uint32_t crc, const void *data, size_t len)
-{
-    return ef_crc32_update(crc, data, len);
-}

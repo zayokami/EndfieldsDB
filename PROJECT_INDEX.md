@@ -1,6 +1,6 @@
 # Endfields DB Project Index
 
-更新时间: 2026-07-07
+更新时间: 2026-07-25
 
 本索引用于快速接手代码库。它描述当前工作区内容，而不只是不含未提交改动的 Git 基线。
 
@@ -176,18 +176,35 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 主要在 `src/ef_index.c`:
 
 - `ef_key_hash`: FNV-1a 字符串哈希。
-- `ef_index_put`: key -> slot，当前工作区新增了自动 rehash 尝试。
-- `ef_index_get`: v4 下用 seqlock 做无全局读锁一致性读。
-- `ef_index_remove` / `ef_index_remove_by_slot`: 删除键或删除指向槽的项。
-- `ef_index_rehash`: 扩容哈希区、搬迁槽区、修正 free list/queue/next_offset，再重插索引项。
-- `ef_index_clear`: 清空哈希区。
+- `ef_index_put`: v4 自动 rehash——插入后若装载率超过 `3/4` 阈值则扩到下一 2 的幂容量（≤ `EF_INDEX_MAX_CAPACITY`）；更新已有 key 不增加 entry count。
+- `ef_index_get`: v4 seqlock 多读者无锁读；读侧 `EF_ERR_INDEX_BUSY` 时调用方应重试。
+- `ef_index_remove` / `ef_index_remove_by_slot`: 删除键或删除指向槽的项（持 index_write_lock）。
+- `ef_index_rehash`: 显式扩容，搬迁槽区、修正 free list / queue 头尾 / `next_offset`，再重插索引项。
+- `ef_index_shrink`: 手动收缩到指定容量（建议先用 `ef_index_pick_shrink_capacity` 计算）。
+- `ef_index_clear`: 清空哈希区，容量保留。
+- `ef_index_iterate` / `ef_index_iterate_until`: 遍历 entry，回调返回 0 继续、1 停止、负数中止并返回 `EF_ERR_USER_ABORT`。
 - `ef_index_capacity` / `ef_index_count_entries`: 当前工作区新增的索引观测 API。
+- `ef_index_pick_shrink_capacity`: 给定当前 entry 数与容量，返回建议收缩目标。
+- `ef_index_bind_layout`: 内部用——根据 `hash_capacity` 计算 `db->hash_index` 与 `db->slots_base`。
+- `ef_index_write_begin` / `ef_index_write_end`: 索引写锁包装（持锁→seq odd→写→seq even→释放）。
 
 装载因子常量在 `src/ef_index.h`:
 
 - `EF_INDEX_REHASH_LOAD_FACTOR_NUM = 3`
 - `EF_INDEX_REHASH_LOAD_FACTOR_DEN = 4`
-- `EF_INDEX_MAX_CAPACITY = 0x8000`
+- `EF_INDEX_SHRINK_LOAD_FACTOR_NUM = 1`
+- `EF_INDEX_SHRINK_LOAD_FACTOR_DEN = 8`
+- `EF_INDEX_MAX_CAPACITY = 0xFFFF`
+
+### 超级块 reserved 布局
+
+主要在 `src/ef_sb_layout.c`:
+
+- `ef_sb_hash_capacity_load` / `ef_sb_hash_capacity_store`: 32-bit RMW 在 4 字节对齐 word 上更新 `hash_capacity`（v4 u16）并保留 `queue_lock` 与 `index_write_lock` u8，避免与 lock acquire CAS 循环产生 TSAN race。
+- `ef_sb_queue_lock_acquire` / `ef_sb_queue_lock_release`: 队列自旋锁。
+- `ef_sb_index_write_lock_acquire` / `ef_sb_index_write_lock_release`: 索引写自旋锁（v4）。
+- `ef_sb_index_write_seq_begin` / `ef_sb_index_write_seq_end` / `ef_sb_index_seq_load` / `ef_sb_index_seq_read_stable`: v4 seqlock 序列号。
+- `ef_sb_migrate_v3_index_layout`: v3 → v4 reserved 布局迁移。
 
 ### CRC 与持久化
 
@@ -220,20 +237,28 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 - 文件后端 blob、reopen、bad magic、readonly、superblock/slot CRC。
 - `tests/test_index_queue.c`: v3/v4 队列和索引生命周期、rehash、v3->v4 index migration。
 - 当前工作区新增 `test_index_auto_rehash`。
-- `test_queue_mpmc`: 多生产者/多消费者队列。
+- `test_index_iterate`: iterate / iterate_until 回调三种返回值路径。
+- `test_index_shrink`: 手动收缩到目标容量，entry count 保留。
 - `test_index_mrsr`: 多读者 + 单写者索引并发。
-- `bench/endfields_bench.c`: 性能套件包含 chase、queue roundtrip、MPMC throughput、hash put/get/remove/rehash、auto rehash bench。
+- `test_index_multi_writer`: 多写者 put/get/remove（4 writers × 800 keys）。
+- `test_index_multi_writer_rehash`: 多写者触发自动 rehash，验证 grow 期间写串行化与读无锁。
+- `test_queue_mpmc`: 多生产者/多消费者队列。
+- `bench/endfields_bench.c`: 性能套件包含 chase、queue roundtrip、MPMC throughput、hash put/get/remove/rehash/auto rehash bench。
 
 `src/main_embedded.c` 覆盖 embedded-only 内存打开、读写、grow、reopen。
 
 ## 当前开发重点
 
-索引自动 rehash 已接入 `ef_index_put`:
+索引 v4 增量（auto rehash / iterate / shrink / multi-writer / MRSW）已合入:
 
-- 新键插入后若会超过 `3/4` 装载率阈值，先扩容到满足阈值的下一个 2 的幂容量。
+- `ef_index_put` 在插入后若超过 `3/4` 装载率，自动扩容到下一 2 的幂容量（≤ 65535）。
 - 更新已有 key 不触发扩容，也不增加 entry count。
-- rehash 会搬迁槽区；插入前必须基于当前 `slots_base` 重新计算 slot offset。
+- `ef_index_rehash` 会搬迁槽区；插入前必须基于当前 `slots_base` 重新计算 slot offset。
 - 内存后端容量不足时返回 `EF_ERR_FILE_SIZE`，旧索引保持可用，新 key 不插入。
+- `ef_index_shrink` + `ef_index_pick_shrink_capacity` 提供手动收缩路径。
+- `ef_index_iterate` / `ef_index_iterate_until` 提供 entry 遍历与回调中止。
+- v4 reserved 布局下 `ef_index_get` 通过 seqlock 多读者无锁；`ef_index_put` / `remove` / `rehash` / `clear` 通过 index_write_lock 自旋锁串行化（多线程排队抢锁，互斥执行）。
+- v3 可写打开时自动迁移到 v4（hash_capacity ≤ 65535）；只读打开 v3 不修改 mmap，并发保护不生效。
 - `bench-out.txt`、`build*/`、根目录 `*.endf` 和 `*.exe` 是本地运行或构建产物，不应作为源码索引依据。
 
 ## 接手建议
