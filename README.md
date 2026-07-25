@@ -2,336 +2,293 @@
 
 [![CI](https://github.com/zayokami/EndfieldsDB/actions/workflows/ci.yml/badge.svg)](https://github.com/zayokami/EndfieldsDB/actions/workflows/ci.yml)
 
-轻量级、零拷贝、基于 mmap 物理寻址的嵌入式数据库核心，使用 C11 实现。
+一个面向 C11 的嵌入式数据库核心：以固定 64 字节槽位 + 文件/内存物理偏移寻址为基础，
+提供持久化 LIFO 空闲链、跨进程 MPMC 队列、Robin Hood 字符串哈希索引、可中止事务和按需 Schema 迁移。
 
-## 特性
+代码量小、依赖少（仅 C 标准库与平台 mmap API），适合塞进服务端、嵌入式或工具里当一个轻量持久层。
 
-- **固定 64 字节槽位**：超级块与槽位均为 64 字节对齐，适合缓存友好访问
-- **零拷贝**：通过 mmap 直接按文件偏移读写，无额外序列化层
-- **物理寻址**：`ef_slot_to_offset` / `ef_offset_to_ptr` 实现 O(1) 槽位定位
-- **指针追逐**：单跳 `ef_chase`、多跳 `ef_chase_n`，带环检测与可选 CPU prefetch
-- **槽位池**：持久化 LIFO 空闲链表（`ef_alloc_slot` / `ef_free_slot`），复用 `next_offset`，无额外元数据开销
-- **尾部自动扩容**（v3）：`ef_alloc` 在空闲链耗尽时 `ef_grow(+1)` 追加槽位
-- **跨进程 MPMC 队列**（v3）：`ef_queue_push` / `ef_queue_pop`，dummy 头节点 + 共享自旋锁，多生产者/多消费者安全；出队在锁内归还槽位，空闲链 CAS 弹入/弹出支持并发分配
-- **Robin Hood 哈希索引**（v3）：`ef_index_put` / `ef_index_get`，字符串键直达槽位，装载率可达 90%+
-- **索引生命周期**（v3）：`ef_free_slot` 自动 `ef_index_remove_by_slot`；`ef_index_rehash` 扩容哈希区并搬迁槽区、修正所有物理偏移
-- **索引自动 rehash**（v4）：`ef_index_put` 在装载率超过 `3/4` 时自动扩容到下一个 2 的幂容量（上限 `EF_INDEX_MAX_CAPACITY`）
-- **索引自动 shrink**（v4）：当 entry 下降到 `1/8` 装载率以下时手动调用 `ef_index_shrink` 可收缩；`ef_index_pick_shrink_capacity` 给出建议容量
-- **索引迭代器**（v4）：`ef_index_iterate` / `ef_index_iterate_until`，回调可中止或中断
-- **索引 MRSW**（v4）：`ef_index_get` 用 seqlock 多读者无锁读；写者（put/remove/rehash/clear）通过 `index_write_lock` 自旋锁串行化，可多线程排队抢锁
-- **v3 → v4 在线迁移**：可写打开 v3 文件时自动迁移哈希容量到 v4 reserved 布局；只读打开 v3 文件**不**启用 v4 并发保护，需先可写打开完成迁移
-- **紧凑指令集**：`ef_execute` 通过 10 字节 `ef_cmd` 派发读写、追逐、分配等操作
-- **动态扩容**：`ef_grow` 扩展槽位数量（文件 truncate + 重映射，或内存后端）
-- **只读打开**：`ef_open_readonly` 以只读 mmap 打开，写操作返回 `EF_ERR_READONLY`
-- **槽位迭代**：`ef_foreach_used` / `ef_slot_iter` 遍历已用头槽（跳过溢出续链槽与队列槽）
-- **溢出链 Blob**：`ef_write_blob` / `ef_read_blob` 支持超过 48 字节的大对象存储
-- **数据校验**（Schema v2+）：超级块 CRC32 + 已用/队列/溢出槽位头 CRC32；超级块 CRC **延迟提交**（`ef_db_commit_meta` / `ef_sync` / `ef_close`）
-- **在线迁移**：`ef_needs_upgrade` / `ef_upgrade` 将 Schema v1 升级为 v2/v3（内联 payload 52→48 字节，尾部 4 字节丢弃）
-- **追逐热路径优化**：`ef_chase` / `ef_chase_n` 使用位移寻址，跳过逐跳 CRC（`ef_get_slot` 仍校验）
-- **多后端**：文件（POSIX / Win32）与纯内存（嵌入式 RAM arena）
-- **持久化**：Linux `msync`；Windows `FlushViewOfFile` + `FlushFileBuffers`
+---
 
-## 目录结构
+## 它解决什么问题
 
-```
-endfields-db/
-├── CMakeLists.txt
-├── LICENSE
-├── README.md
-├── THREADING.md                    # 并发与跨进程语义
-├── PROJECT_INDEX.md                # 代码库接手索引
-└── src/
-    ├── endfields.h / endfields.c   # 核心 API
-    ├── ef_config.h                 # 编译选项与 schema 版本
-    ├── ef_index.h / ef_index.c     # Robin Hood 字符串索引（v4 MRSW + auto rehash + shrink + iterate）
-    ├── ef_sb_layout.h / ef_sb_layout.c # 超级块 reserved[28] 布局与 v3→v4 迁移
-    ├── ef_port.h / ef_port.c       # 平台 I/O 抽象
-    ├── ef_atomic_unaligned.h       # mmap 字段原子 helper
-    ├── ef_crc.h / ef_crc.c         # CRC32 portable
-    ├── ef_crc_pclmul.c             # x86-64 PCLMULQDQ 快路径
-    ├── main.c                      # 文件 + 内存综合测试
-    └── main_embedded.c             # 纯嵌入式测试
-```
+很多 C 项目需要一个小而可控的本地数据存储：写几条记录、读回来、可能要按字符串 key 取、要能跨进程排队消费、最好能 ACID 事务和崩溃恢复。
 
-## 构建
+Endfields DB 把这些做成一个**库**，而不是一个独立服务：
 
-需要 **CMake ≥ 3.16** 与 **GCC**（推荐 MinGW on Windows）。
+- **不分层** — 没有独立的 server / 协议 / 客户端，直接 `#include "endfields.h"` 调用 `ef_alloc` / `ef_write_payload` / `ef_index_get` / `ef_txn_begin`。
+- **物理偏移寻址** — 数据按 64 字节槽位对齐，`ef_offset_to_ptr(slot_id)` 是 O(1) 的指针查表，方便 mmap / `ef_chase` 之类的指针追逐热路径。
+- **零拷贝** — 槽位直接映射到调用方地址空间，payload 字段就是你文件的对应字节；不需要序列化层。
+- **一个文件，多种后端** — 同一份库既可以用 `ef_open_ex` 落到磁盘 mmap，也可以用 `ef_open_memory` 跑在嵌入式 RAM arena 上；schema、API、CRC、并发模型全部一致。
+- **可选能力按需启用** — 没有索引？`hash_capacity=0`，文件布局与传统 v3 一样；要 ACID？包一层 `ef_txn_begin` / `commit`。
 
-```bash
-cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build
-```
+---
 
-Linux（GCC）：
+## 能力一览
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build
-```
+| 类别 | 提供 |
+|------|------|
+| 持久化 | 文件 mmap（POSIX `mmap` / Win32 `MapViewOfFile`）或纯 RAM arena；`ef_sync` 显式落盘 |
+| 数据模型 | 固定 64 字节槽位、48 字节内联 payload；超大对象走 OVERFLOW 链式 blob |
+| 寻址 | slot id ↔ 物理偏移 ↔ mmap 指针；`ef_chase` / `ef_chase_n` 走 `next_offset` 链 |
+| 分配器 | 持久化 LIFO 空闲链（`ef_alloc_slot` / `ef_free_slot`）；池空时 `ef_alloc` 自动 grow |
+| 索引 | Robin Hood 字符串哈希（`ef_index_put/get/remove/iterate/clear`），自动 rehash + 手动 shrink |
+| 队列 | 跨进程 MPMC dummy-head FIFO（`ef_queue_push/pop`），超级块自旋锁 |
+| 事务 (v5) | `ef_txn_begin` / `commit` / `abort`；strict serializable isolation；abort 反向 replay undo log；进程崩溃自动 recover |
+| 校验 | 槽位头 CRC32 + 超级块延迟 CRC 提交；x86 PCLMULQDQ 快路径 |
+| 迁移 | v1 → v2/v3 → v4 → v5 在线升级，可写打开自动追加 undo log 段；只读打开保持旧布局 |
 
-### CI（严格模式）
+当前 schema 版本：**v5**（`EF_SCHEMA_VERSION 5`，在 `src/ef_config.h`）。
 
-push/PR 到 `main` 时自动运行 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
+---
 
-| Job | 配置 |
-|-----|------|
-| Linux GCC | Release、Debug、无 prefetch、ASan+UBSan、TSan、coverage |
-| Linux Clang | Release |
-| macOS Clang | Release |
-| Windows MSVC | Release |
-| Windows MinGW | Release、Debug |
-| Linux Clang static analysis | clang-tidy + cppcheck |
-| embedded-only | `ENDFIELDS_EMBEDDED_ONLY=ON` |
-
-所有 job 启用 **`-Werror`**（`ENDFIELDS_WARNINGS_AS_ERRORS=ON`）与 **CI 快速 bench**（`ENDFIELDS_CI_FAST=ON`，功能测试不变）。`ctest` 使用 `--timeout 900` 与 `--no-tests=error`。
-
-本地复现严格 CI：
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-  -DENDFIELDS_WARNINGS_AS_ERRORS=ON -DENDFIELDS_CI_FAST=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-建议在 GitHub 仓库 **Settings → Branches → Branch protection** 中将 `CI gate` 设为 required check。
-
-产物：
-
-- `libendfields.a` — 文件 + 内存后端
-- `libendfields_embedded.a` — 纯 RAM 后端（无文件 I/O）
-- `endfields_test` / `endfields_embedded_test` — 测试可执行文件
-
-链接示例：
-
-```cmake
-target_link_libraries(your_app PRIVATE endfields)
-target_include_directories(your_app PRIVATE path/to/endfields/src)
-```
-
-### CMake 选项
-
-| 选项 | 默认 | 说明 |
-|------|------|------|
-| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 仅 RAM 后端，禁用文件 I/O；不构建 `endfields_test` |
-| `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
-| `ENDFIELDS_WARNINGS_AS_ERRORS` | OFF | `-Werror`（CI 开启） |
-| `ENDFIELDS_SANITIZE` | OFF | GCC/Clang：AddressSanitizer + UBSan |
-| `ENDFIELDS_TSAN` | OFF | ThreadSanitizer（CI 开启） |
-| `ENDFIELDS_COVERAGE` | OFF | gcov/lcov（CI 开启） |
-| `ENDFIELDS_CI_FAST` | OFF | 缩短 bench 轮次（CI 开启，功能测试不变） |
-
-内存后端 `ef_grow` 在 `map_capacity` 范围内扩展 `file_size`；`ef_open_memory` 重开时会按超级块中的 `max_slots` 自动识别已扩容大小。
-
-多线程与跨进程语义见 **[THREADING.md](THREADING.md)**（队列 MPMC、空闲链 CAS、索引 MRSW、调用方串行化约束）。
-
-## 快速示例
+## 30 秒上手
 
 ```c
 #include "endfields.h"
 #include "ef_index.h"
 
-/* 带 Robin Hood 索引的 v4 库（capacity 须为 2 的幂，≤ 65535） */
 struct ef_db *db = NULL;
-enum ef_err err = ef_open_ex_hash("data.endf", 64, 256, &db);
-if (err != EF_OK || db == NULL) { return 1; }
 
-uint64_t id;
-ef_alloc(db, &id);                  /* 弹空闲链；池空时自动 ef_grow(+1) */
+/* 文件 + Robin Hood 索引（hash_capacity 必须为 2 的幂，≤ 65535） */
+if (ef_open_ex_hash("data.endf", 64, 256, &db) != EF_OK || db == NULL) {
+    return 1;
+}
+
+/* 写一条记录并索引 */
+uint64_t id = 0;
+ef_alloc(db, &id);
 ef_write_payload(db, id, "hello", 5);
-ef_index_put(db, "greeting", id);   /* v4: 装载率超 3/4 时自动 rehash */
+ef_index_put(db, "greeting", id);
 
-uint64_t found;
-ef_index_get(db, "greeting", &found);
+/* 按 key 取出来 */
+uint64_t found = 0;
+if (ef_index_get(db, "greeting", &found) == EF_OK) {
+    /* ... */
+}
 
-/* FIFO 队列（跨进程 MPMC） */
-ef_queue_push(db, "msg", 3);
-char buf[64];
-size_t n;
-ef_queue_pop(db, buf, sizeof(buf), &n);
-
-/* 多线程消费者：所有生产者结束后，锁下确认队列已排空再退出 */
-if (ef_queue_drained(db)) { /* safe to shut down workers */ }
-
-/* 显式 rehash 到更大容量 */
-ef_index_rehash(db, 512);
-
-/* 索引迭代：回调返回 0 继续，1 停止，负数中止（EF_ERR_USER_ABORT） */
-ef_index_iterate_until(db, my_iter_cb, NULL);
-
-/* 手动收缩到指定容量（建议先用 ef_index_pick_shrink_capacity 计算） */
-uint32_t target = ef_index_pick_shrink_capacity(
-    ef_index_count_entries(db), ef_index_capacity(db));
-if (target != 0 && target < ef_index_capacity(db)) {
-    ef_index_shrink(db, target);
+/* ACID 事务：失败自动回滚 */
+ef_txn_begin(db);
+ef_alloc_slot(db, &id);
+ef_write_payload(db, id, "draft", 5);
+ef_index_put(db, "k", id);
+if (/* 业务条件不满足 */ 0) {
+    ef_txn_abort(db);   /* 所有写入全部撤销 */
+} else {
+    ef_txn_commit(db);  /* 原子生效 */
 }
 
 ef_sync(db);
 ef_close(db);
 ```
 
-### 仅 v2/v3 文件（无索引区）
+完整 API 列表见 [`src/endfields.h`](src/endfields.h)、[`src/ef_index.h`](src/ef_index.h)、[`src/ef_txn.h`](src/ef_txn.h)。
 
-```c
-/* 与旧版文件布局兼容：不创建哈希区 */
-ef_open_ex("data.endf", 64, &db);
-```
+---
 
-### 只读打开
+## 关键概念
 
-```c
-struct ef_db *ro = NULL;
-if (ef_open_readonly_ex("data.endf", &ro) == EF_OK) {
-    /* 读操作可用，写操作返回 EF_ERR_READONLY */
-    ef_close(ro);
-}
-```
+### 槽位 (slot)
 
-### Schema v1 → v2/v3 迁移
-
-```c
-if (ef_needs_upgrade(db)) {
-    ef_upgrade(db);
-    ef_sync(db);
-}
-```
-
-## 文件布局
-
-### Schema v4（`hash_capacity > 0`）
+所有数据都装在 **64 字节**对齐的槽里，超级块自身也是一个槽：
 
 ```
-[超级块 64B][哈希索引区 capacity × 16B][数据槽区 max_slots × 64B]
+status u32 | header_crc u32 | payload[48] | next_offset u64   →  共 64 字节
 ```
 
-### Schema v3 / v4（`hash_capacity = 0`，默认 `ef_open_ex`）
+`status` 取值见 [`src/endfields.h`](src/endfields.h)（`EF_STATUS_USED` / `_FREE` / `_OVERFLOW` / `_QUEUED` / `_QUEUE_DUMMY` 等）。`next_offset` 既给空闲链当链表指针，也给 blob 链和队列当续接指针；`ef_chase` / `ef_chase_n` 就是顺着它走的。
+
+### 物理寻址
+
+数据地址用 **文件/buffer 内的字节偏移** 表示，不是内存指针：
+
+| 转换 | 用途 |
+|------|------|
+| `ef_slot_to_offset(slot_id)` | id → 物理偏移 |
+| `ef_offset_to_slot_id(offset)` | 偏移 → id（用于反查） |
+| `ef_offset_to_ptr(db, offset)` | 偏移 → 当前 mmap/buffer 内的可读写指针 |
+| `ef_chase(db, start, fn, ctx)` | 沿 `next_offset` 单跳或多跳遍历 |
+
+这意味着槽位可以被 mmap 到不同地址、文件可以被重映射、rehash 可以挪动整个 slot 区域——只要偏移对得上就行。
+
+### 文件布局
 
 ```
+v5（带索引 + 事务）:
+[超级块 64B][哈希索引 capacity × 16B][数据槽区 max_slots × 64B][Undo Log 段]
+
+v3/v4（带索引，无事务）:
+[超级块 64B][哈希索引 capacity × 16B][数据槽区 max_slots × 64B]
+
+v3/v4（无索引，向后兼容）:
 [超级块 64B][数据槽区 max_slots × 64B]
 ```
 
-`ef_open_ex` / `ef_open_memory` 新建库时 `hash_capacity = 0`，与旧版文件大小一致。需要字符串索引时使用 `ef_open_ex_hash` / `ef_open_memory_hash`。可写打开 v3 文件时，若 `hash_capacity ≤ 65535`，会自动迁移到 v4 reserved 布局以启用索引 MRSW；只读打开 v3 文件不会修改 mmap，并发保护**不生效**。
+新建数据库时 `hash_capacity=0` 就是无索引的紧凑布局；任何 schema 都会在可写打开时按需自动迁移到 v5，并补齐 undo log 段，**不会触碰已有数据**。
 
-### Schema v2/v3/v4 槽位布局
+### FIFO 队列
 
+dummy-head 链表，head / tail / lock 都放在超级块 `reserved[]` 里。push 和 pop 在同一把自旋锁下完成；空队列 lazy 分配 dummy 哨兵槽。
+
+- `ef_queue_empty` 是**无锁**快路径，仅作启发式判断。
+- 多消费者在所有生产者结束后应当用 `ef_queue_drained`（持锁检查）确认排空再退出。
+- 高争用返回 `EF_ERR_QUEUE_BUSY`，调用方应重试。
+
+### 索引
+
+字符串键经 FNV-1a 哈希为 `uint64_t`，Robin Hood 线性探测，**只存哈希不存原 key**。
+
+- 装载率超 `3/4` 时 `ef_index_put` 自动 rehash 到下一 2 的幂容量（上限 `EF_INDEX_MAX_CAPACITY = 65535`）。
+- `ef_index_get` 用 seqlock 实现**多读者无锁**读；遇到写者时返回 `EF_ERR_INDEX_BUSY`，调用方应重试。
+- 写者（put / remove / rehash / clear）共用 `index_write_lock` 串行化。
+- `ef_index_rehash` **会搬迁 slot 区**，调用方不得与槽位写并发。
+
+### 事务 (v5)
+
+```c
+ef_txn_begin(db);
+// 所有 mutating API（alloc/free/index_put/index_remove/queue_push/queue_pop/write_payload/write_blob...）
+// 都会向 undo log 追加反向记录
+ef_txn_commit(db);   // 提交：清空 undo log，释放 txn_lock
+ef_txn_abort(db);    // 回滚：反向 replay undo log 还原，再释放锁
 ```
-status (4) | header_crc (4) | payload[48] | next_offset (8)  →  64 字节
+
+要点：
+
+- **strict serializable isolation**：通过独立 `txn_lock` 与 `index_write_lock` / `queue_lock` 解耦，无死锁。
+- 事务期间 `ef_grow` 返回 `EF_ERR_GROW`；`ef_index_put` 触发 rehash 时返回 `EF_ERR_INDEX_BUSY`（必须先在外面扩好容量）。
+- **跨进程崩溃恢复**：open 时若检测到 `txn_state == ACTIVE` 且当前进程 pid / epoch 不匹配，自动 replay undo log 后释放锁，数据库回到一致状态。
+- v4 → v5 迁移对已有数据透明：可写打开时由 `ef_sb_migrate_v4_txn_layout` 追加 undo log 段并刷新超级块 CRC。
+
+---
+
+## 并发模型速览
+
+详细说明见 [`THREADING.md`](THREADING.md)。快速记忆：
+
+| 资源 | 并发安全 |
+|------|----------|
+| `ef_queue_push` / `ef_queue_pop` | ✅ MPMC（跨进程 + 跨线程） |
+| `ef_index_get` | ✅ 多读者无锁（seqlock） |
+| `ef_index_put` / `remove` / `rehash` | 🔒 单写者（`index_write_lock`），多线程排队 |
+| `ef_txn_begin` / `commit` / `abort` | 🔒 单事务（`txn_lock` CAS），与上面两把锁无死锁 |
+| 空闲链 | ✅ GCC/Clang 下 CAS 弹入/弹出 |
+| 槽位 payload / blob 数据 / chase | ⚠️ 调用方外部同步 |
+| `ef_sync` / `ef_close` | ⚠️ 调用方串行化所有写者 |
+
+事务期间禁止 grow 和 auto-rehash，调用方在 begin 之前应当**预分配好容量**。
+
+---
+
+## 构建
+
+需要 **CMake ≥ 3.16** + 一个支持 C11 的编译器（GCC / Clang / MSVC / MinGW）。
+
+### 最简构建
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-| status | 值 | 说明 |
-|--------|-----|------|
-| `EF_STATUS_FREE` | 0 | 空闲链节点 |
-| `EF_STATUS_USED` | 1 | 普通头槽或 blob 头槽 |
-| `EF_STATUS_OVERFLOW` | 2 | blob 溢出续链槽（全 48 字节承载数据） |
-| `EF_STATUS_QUEUED` | 3 | FIFO 队列数据节点 |
-| `EF_STATUS_QUEUE_DUMMY` | 4 | 队列哨兵头（惰性分配，常驻） |
-| `EF_STATUS_QUEUE_LINK` | 5 | 入队链接中（内部） |
-| `EF_STATUS_QUEUE_DEQ` | 6 | 出队摘链中（内部） |
+Windows MinGW：
 
-Blob 头槽 `payload[0..3]` 为 magic `BLOB`，`payload[4..7]` 为 `uint32_t` 总长度，内联数据从第 8 字节起（最多 40 字节）；超出部分经 `next_offset` 串联 `OVERFLOW` 槽。`ef_write_payload` 与 blob 格式互不干扰。
+```bash
+cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
-### 超级块 `reserved[28]`（v4）
+### 严格 CI（本地复现）
 
-| 偏移 | 字段 | 说明 |
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DENDFIELDS_WARNINGS_AS_ERRORS=ON -DENDFIELDS_CI_FAST=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure --timeout 900 --no-tests=error
+```
+
+CI 矩阵见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：Linux GCC / Clang（Release、Debug、ASan+UBSan、TSan、coverage）、macOS Clang、Windows MSVC、Windows MinGW、static analysis（clang-tidy + cppcheck）、embedded-only。
+
+### CMake 选项
+
+| 选项 | 默认 | 作用 |
 |------|------|------|
-| `[0..3]` | CRC32 | 超级块校验和（`EF_FLAG_SB_CRC`） |
-| `[4..11]` | `queue_head_offset` | 指向 dummy 哨兵槽（物理偏移） |
-| `[12..19]` | `queue_tail_offset` | 队列尾（物理偏移） |
-| `[20..21]` | `hash_capacity` u16 | Robin Hood 表容量（2 的幂，0 表示无索引区；上限 65535） |
-| `[22]` | `queue_lock` u8 | 跨进程自旋锁（0=空闲） |
-| `[23]` | `index_write_lock` u8 | 索引写自旋锁（0=空闲） |
-| `[24..27]` | `index_seq` u32 | seqlock：偶数=稳定，奇数=写者活跃 |
+| `ENDFIELDS_EMBEDDED_ONLY` | OFF | 只构建纯 RAM 后端 |
+| `ENDFIELDS_ENABLE_PREFETCH` | ON | 追逐热路径启用 `__builtin_prefetch` |
+| `ENDFIELDS_WARNINGS_AS_ERRORS` | OFF | `-Werror` |
+| `ENDFIELDS_SANITIZE` | OFF | ASan + UBSan |
+| `ENDFIELDS_TSAN` | OFF | ThreadSanitizer |
+| `ENDFIELDS_COVERAGE` | OFF | gcov / lcov |
+| `ENDFIELDS_CI_FAST` | OFF | 缩短 bench 轮次 |
 
-v3 布局中 `[20..23]` 为 `hash_capacity` u32，`[24..27]` 为 `queue_lock` u32；v4 在容量 ≤ 65535 时把 `hash_capacity` 压缩为 u16，腾出两个字节分别放 `queue_lock` 和 `index_write_lock` u8，并把 `index_seq` 提到 `[24..27]`。
+### 链接
 
-`free_count` 为 `uint32_t`（与 `reserved` 扩展共同保持超级块 64 字节）。
-
-### 哈希索引项（16 字节）
-
-```
-key_hash (8) | slot_offset (8)
+```cmake
+target_link_libraries(your_app PRIVATE endfields)
+target_include_directories(your_app PRIVATE path/to/endfields-db/src)
 ```
 
-- 键经 FNV-1a 哈希为 `key_hash`（原始字符串不存入文件）
-- Robin Hood 线性探测，支持高装载率下的缓存友好查找
-- `EF_INDEX_REHASH_LOAD_FACTOR = 3/4`：`ef_index_put` 自动 rehash 阈值
-- `EF_INDEX_SHRINK_LOAD_FACTOR = 1/8`：`ef_index_shrink` 调用前的建议阈值
-- `EF_INDEX_MAX_CAPACITY = 0xFFFF = 65535`：v4 哈希容量上限
+产物：`libendfields.a`（文件 + 内存后端）、`libendfields_embedded.a`（纯 RAM）、
+四个测试可执行文件 `endfields_core_test` / `endfields_index_queue_test` / `endfields_embedded_test` / `endfields_bench`。
 
-### FIFO 队列 payload 编码
-
-队列槽 `payload` 布局：`[1 字节长度][数据…]`，最大数据 **47 字节**（`len` 参数为数据长度，不含长度前缀）。
-
-首次 `ef_queue_push` 惰性分配 dummy 哨兵槽；逻辑空队列为 `dummy.next_offset == 0`（`ef_queue_empty`，无锁快路径）。
-
-`ef_queue_drained` 在持有 `queue_lock` 时检查是否无待处理消息，适合多线程消费者在「所有生产者已结束」后安全退出（`ef_queue_empty` 仅作启发式判断，高并发下可能误判）。
-
-并发语义：
-
-- 入队/出队临界区由超级块 `queue_lock` 自旋锁保护（GCC/Clang `__atomic` CAS）
-- 出队摘链后在**同一临界区内**调用 `ef_return_slot_to_pool`，避免槽位被并发复用时尚未脱离队列生命周期
-- 入队失败（如 `EF_ERR_QUEUE_BUSY`）时通过 `ef_return_slot_to_pool` 回收已分配槽（`ef_free_slot` 无法释放 `QUEUED` 状态）
-- 空闲链在支持原子操作的平台使用 CAS 栈式弹入/弹出，与队列并发安全
-- 高争用返回 `EF_ERR_QUEUE_BUSY`，调用方应重试
-
-## Robin Hood 索引 API（v4）
-
-| API | 说明 |
-|-----|------|
-| `ef_index_put(db, key, slot_id)` | 插入或更新键；**自动 rehash** 到下一 2 的幂容量当超过 3/4 装载率；更新已有 key 不增加 entry count |
-| `ef_index_get(db, key, *slot_out)` | 多读者**无锁**（seqlock）查询；读侧重试耗尽返回 `EF_ERR_INDEX_BUSY`，调用方应重试 |
-| `ef_index_remove(db, key)` | 按键删除（持 index_write_lock） |
-| `ef_index_remove_by_slot(db, slot_id)` | 按槽位物理偏移删除（`ef_free_slot` 调用），持 index_write_lock |
-| `ef_index_rehash(db, new_capacity)` | 显式扩容：搬迁槽区、修正 free list / queue 头尾 / `next_offset`；`new_capacity` 须为 2 的幂且 > 当前容量（grow 模式） |
-| `ef_index_shrink(db, new_capacity)` | 收缩到 `new_capacity`；用于 `1/8` 装载率以下场景。`ef_index_pick_shrink_capacity` 给建议目标 |
-| `ef_index_clear(db)` | 清空哈希区，容量保留 |
-| `ef_index_iterate(db, cb, user)` | 遍历所有 entry（回调返回 0 继续，1 停止，负数中止并返回 `EF_ERR_USER_ABORT`） |
-| `ef_index_iterate_until(db, cb, user)` | 同上但省略某些终止语义（见实现） |
-| `ef_index_capacity(db)` | 返回当前容量（0 表示索引未启用） |
-| `ef_index_count_entries(db)` | 返回占用 entry 数（线性扫描） |
-| `ef_index_pick_shrink_capacity(entries, current)` | 计算建议收缩目标 |
-
-`ef_index_rehash` 会搬迁槽区，**调用方不得与槽位写并发执行**；同一时刻只能有一个索引写临界区（多线程可排队抢 index_write_lock，但互斥执行）。
-
-## 空闲链表与分配
-
-删除槽位时：`status → FREE`，`next_offset ← free_list_head`，`free_list_head ← 本槽物理偏移`（LIFO，O(1)）。若槽曾被索引，先 `ef_index_remove_by_slot`。
-
-| API | 行为 |
-|-----|------|
-| `ef_alloc_slot` | 从空闲链弹出；池空返回 `EF_ERR_SLOT_FULL` |
-| `ef_alloc` | 同上；池空时 `ef_grow(max_slots + 1)` 后重试 |
-| `ef_alloc_ex(db, *slot, flags)` | `EF_ALLOC_ZERO_PAYLOAD=1` 清零 payload；0 跳过清零（队列热路径） |
-| `ef_free_slot` | 归还空闲链并清除索引项（队列槽须先 `ef_queue_pop`） |
-| `ef_index_rehash` | 扩容哈希区、搬迁槽区、修正 free_list / queue / next_offset 后重插 |
-| `ef_index_remove_by_slot` | 按槽位物理偏移扫描并删除索引项 |
-| `ef_queue_empty` | 无锁快路径：dummy 未分配或 `dummy.next == 0` |
-| `ef_queue_drained` | 持锁检查队列无待处理消息（多线程消费者退出用） |
-| `ef_db_refresh_slot_crcs` | 刷新所有需 CRC 的槽头（rehash 后可选） |
-| `ef_db_commit_meta` | 立即刷新延迟的超级块 CRC（`ef_sync` / `ef_close` 亦会调用） |
+---
 
 ## 测试覆盖
 
-`src/main.c` 中的核心功能测试：
+测试入口拆分（见 [`CMakeLists.txt`](CMakeLists.txt)）：
 
-- `test_grow_memory` — 拒绝非法扩容、4→8→16 扩容、数据保留、重开识别
-- `test_slot_header_crc_*` — 头 CRC / 溢出槽 CRC 篡改、`ef_foreach_used` / `ef_slot_iter` 中止、磁盘篡改后只读打开拒绝
-- `test_v3_alloc_queue_index` — 尾部 grow 分配、FIFO 队列往返、Robin Hood 索引 put/get/remove、队列持久化重开
-- `test_index_lifecycle_and_rehash` — 索引 put → rehash 16→32 → free 后 get 应 NOT_FOUND
-- `test_index_auto_rehash` — 装载率超阈值自动 rehash，entry count 正确，重开容量保留
-- `test_index_iterate` — iterate / iterate_until 回调三种返回值路径
-- `test_index_shrink` — 手动收缩到目标容量，entry count 保留，再次 put 不触发不必要的 rehash
-- `test_v3_to_v4_index_migration` — 可写打开 v3 文件后，hash_capacity 压缩为 u16，reserved 布局迁移为 v4
-- `test_index_mrsr` — 多读者 + 单写者（pthread / Win32 线程），read 与 write 互不干扰；读侧偶遇写者时自动重试
-- `test_index_multi_writer` — 多写者 put/get/remove（4 writers × 800 keys），验证原子计数
-- `test_index_multi_writer_rehash` — 多写者触发自动 rehash，验证 grow 期间的写串行化与读无锁
-- `test_queue_mpmc` — 4 线程（2 生产者 × 200，2 消费者），400 条消息各送达一次；Windows 用 Win32 线程，POSIX 用 **pthread**；消费者用 `ef_queue_drained` 在锁下确认排空后退出
+- `tests/test_core.c` — 基础读写、CRC、blob、grow、reopen、事务 commit/abort/persist/grow-forbidden
+- `tests/test_index_queue.c` — 索引 put/get/rehash/shrink/iterate、队列 MPMC、v3→v4 / v4→v5 迁移、事务下队列/索引行为
+- `src/main_embedded.c` — 纯 RAM 后端
+- `bench/endfields_bench.c` — chase / queue / MPMC / hash / `bench_txn_roundtrip`
 
-性能套件（`main.c`）另含 **MPMC 吞吐 bench**（5 轮 × 4 线程 × 4000 消息），槽位池按 `消息数 + 64` 预分配以避免高并发下槽位耗尽；**Hash index bench** 测量 put/remove/get/rehash/auto-rehash/per-collision 延迟。
+跑单个二进制：`./build/endfields_core_test`；按 ctest 名过滤：`ctest --test-dir build -R txn --output-on-failure`。
 
-`src/main_embedded.c` 覆盖 embedded-only 内存打开、读写、grow、reopen。
+---
+
+## 项目结构
+
+```
+endfields-db/
+├── CMakeLists.txt
+├── README.md                      # 你正在读的
+├── THREADING.md                    # 并发与跨进程语义
+├── PROJECT_INDEX.md                # 代码库接手索引
+├── CLAUDE.md                       # 给 AI 助手的项目导览
+├── src/
+│   ├── endfields.h / .c            # 公共 API 与核心实现
+│   ├── ef_index.h / .c             # Robin Hood 索引（v4 seqlock + 自动 rehash + shrink）
+│   ├── ef_sb_layout.h / .c         # 超级块 reserved[] 布局与 v3→v4→v5 迁移
+│   ├── ef_txn.h / .c               # 事务 API 与状态机 (v5)
+│   ├── ef_undo.h / .c              # undo log 段、记录格式、replay/reset (v5)
+│   ├── ef_blob.c                   # 大对象链
+│   ├── ef_grow.c                   # 自动扩容
+│   ├── ef_port.h / .c              # 文件/内存 I/O 抽象
+│   ├── ef_atomic_unaligned.h       # mmap 字段原子 helper
+│   ├── ef_crc.h / .c / _pclmul.c   # CRC32 portable + x86 PCLMULQDQ
+│   ├── ef_config.h                 # schema 版本、平台开关
+│   ├── main.c / main_embedded.c    # 历史测试入口（已拆分为 tests/）
+├── tests/
+│   ├── test_common.h / .c
+│   ├── test_core.c
+│   └── test_index_queue.c
+├── bench/
+│   └── endfields_bench.c
+└── .github/workflows/ci.yml
+```
+
+---
+
+## 接手顺序建议
+
+1. **想用 API**：本 README 的「30 秒上手」+ 头文件 [`src/endfields.h`](src/endfields.h)。
+2. **关心并发**：[`THREADING.md`](THREADING.md)。
+3. **想理解代码组织**：[`PROJECT_INDEX.md`](PROJECT_INDEX.md)。
+4. **修改 `superblock.reserved[]` 布局**：永远只动 [`src/ef_sb_layout.h`](src/ef_sb_layout.h) / `.c`，并在三种迁移路径（v3→v4、v4→v5、嵌入式初始化）里都加测试。
+5. **改并发路径**：本地同时跑 ASan + UBSan 与 TSan 配置；新增功能测试时尽量加一个并发变种。
+
+---
 
 ## 许可证
 
