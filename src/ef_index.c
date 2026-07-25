@@ -328,6 +328,10 @@ static enum ef_err ef_index_find_entry(const struct ef_db *db, uint64_t key_hash
 {
     uint32_t attempt;
 
+    if (db == NULL || db->hash_index == NULL || db->hash_capacity == 0 || out == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+
     if (!ef_index_has_seqlock(db)) {
         return ef_index_find_entry_unlocked(db, key_hash, out);
     }
@@ -455,6 +459,56 @@ enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_ou
     }
 
     return ef_offset_to_slot_id(db, found.slot_offset, slot_id_out);
+}
+
+enum ef_err ef_index_get_slot(struct ef_db *db, const char *key,
+                              struct ef_slot **slot_out,
+                              void *buf, size_t buf_cap, size_t *len_out)
+{
+    struct ef_hash_entry found;
+    uint64_t slot_id = 0;
+    enum ef_err err;
+    struct ef_slot *slot;
+    size_t cap;
+
+    if (db == NULL || key == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+
+    err = ef_index_find_entry(db, ef_key_hash(key, strlen(key)), &found);
+    if (err != EF_OK) {
+        return err;
+    }
+
+    err = ef_offset_to_slot_id(db, found.slot_offset, &slot_id);
+    if (err != EF_OK) {
+        return err;
+    }
+
+    slot = ef_peek_slot(db, slot_id);
+    if (slot == NULL) {
+        return EF_ERR_SLOT_ID;
+    }
+
+    if (slot_out != NULL) {
+        *slot_out = slot;
+    }
+
+    cap = ef_payload_capacity(db);
+    if (len_out != NULL) {
+        *len_out = cap;
+    }
+
+    if (buf != NULL) {
+        if (buf_cap < cap) {
+            return EF_ERR_PAYLOAD_LEN;
+        }
+        if (cap > 0) {
+            memcpy(buf, ef_slot_payload_ptr(db, slot), cap);
+        }
+    }
+
+    return EF_OK;
 }
 
 #if EF_HAS_FILE_IO

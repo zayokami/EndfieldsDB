@@ -586,6 +586,93 @@ static void run_hash_perf_suite(volatile uintptr_t *sink)
     bench_print_stats("ef_index_put + auto rehash (cap 16->grows)", auto_iters, BENCH_ROUNDS, samples);
 }
 
+static void bench_ef_index_put_at_load(volatile uintptr_t *sink)
+{
+    /* Pin capacity to 4096 so the put loop never trips auto-rehash. We measure put
+     * cost at four load-factor targets so the curve vs. collision rate is visible.
+     * The prefill + bench together must stay below the 3/4 rehash threshold:
+     * 3/4 * 4096 == 3072 entries. */
+    static alignas(64) uint8_t load_arena[64 + 4096 * 16 + 8192 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id;
+    char key[32];
+    const uint32_t fixed_capacity = 4096U;
+    const uint32_t target_loads[] = {(fixed_capacity * 10U) / 100U,
+                                     (fixed_capacity * 25U) / 100U,
+                                     (fixed_capacity * 50U) / 100U,
+                                     (fixed_capacity * 70U) / 100U};
+    const int n_targets = (int)(sizeof(target_loads) / sizeof(target_loads[0]));
+    const int put_iters = 2000;
+    double sec[BENCH_MAX_ROUNDS];
+    int t;
+    int r;
+    int i;
+
+    printf("\n=== Hash index per-collision put (cap pinned=%u) ===\n", fixed_capacity);
+
+    for (t = 0; t < n_targets; ++t) {
+        const uint32_t fill = target_loads[t];
+        const int room = (int)(((fixed_capacity * EF_INDEX_REHASH_LOAD_FACTOR_NUM) /
+                                EF_INDEX_REHASH_LOAD_FACTOR_DEN) -
+                               fill);
+        const int iters = (room < put_iters) ? (room > 0 ? room : 1) : put_iters;
+        char label[64];
+
+        err = ef_open_memory_hash(load_arena, sizeof(load_arena), 8192, fixed_capacity, 1, &db);
+        if (err != EF_OK || db == NULL) {
+            fprintf(stderr, "per-collision bench: open failed at load %u: %s\n",
+                    fill, ef_strerror(err));
+            return;
+        }
+
+        for (i = 0; i < (int)fill; ++i) {
+            uint64_t pre_slot;
+            snprintf(key, sizeof(key), "load-%04d", i);
+            err = ef_alloc(db, &pre_slot);
+            if (err != EF_OK) {
+                fprintf(stderr, "per-collision bench: prefill alloc failed\n");
+                ef_close(db);
+                return;
+            }
+            err = ef_index_put(db, key, pre_slot);
+            if (err != EF_OK) {
+                fprintf(stderr, "per-collision bench: prefill put failed\n");
+                ef_close(db);
+                return;
+            }
+        }
+
+        for (r = 0; r < BENCH_ROUNDS; ++r) {
+            double t0;
+            double t1;
+            t0 = now_seconds();
+            for (i = 0; i < iters; ++i) {
+                err = ef_alloc(db, &slot_id);
+                if (err != EF_OK) {
+                    break;
+                }
+                snprintf(key, sizeof(key), "bench-r%dt%d-%05d", r, t, i);
+                err = ef_index_put(db, key, slot_id);
+                if (err != EF_OK) {
+                    *sink ^= (uintptr_t)err;
+                    break;
+                }
+            }
+            t1 = now_seconds();
+            sec[r] = (t1 - t0) * 1e9 / (double)iters;
+        }
+
+        snprintf(label, sizeof(label), "put @ load=%u/%u (~%u%%)",
+                 fill, fixed_capacity,
+                 (fill * 100U) / fixed_capacity);
+        bench_print_stats(label, iters, BENCH_ROUNDS, sec);
+
+        ef_close(db);
+        db = NULL;
+    }
+}
+
 static void run_perf_suite(struct ef_db *db)
 {
     struct ef_cmd chase_cmd;
@@ -767,6 +854,7 @@ static void run_perf_suite(struct ef_db *db)
     bench_print_stats("ef_db_commit_meta (batch after 20k allocs)", 1, BENCH_ROUNDS, samples);
 
     run_hash_perf_suite(&sink);
+    bench_ef_index_put_at_load(&sink);
 #if EF_RUN_BENCH_MPMC && EF_HAS_FILE_IO
     bench_mpmc_throughput(&sink);
 #endif

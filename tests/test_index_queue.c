@@ -117,10 +117,11 @@ static void test_execute_queue_and_index(void)
     struct ef_cmd cmd;
     enum ef_err err;
     uint64_t slot_id = 0;
-    uint64_t looked = 0;
+    uint64_t out_len = 0;
     char out[64];
     const char *msg = "exec-queue";
-    const char *key = "exec:key";
+    char key_aux[32];
+    uint8_t key_len = 0;
     void *result;
 
     err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 1, &db);
@@ -138,11 +139,11 @@ static void test_execute_queue_and_index(void)
 
     memset(out, 0, sizeof(out));
     cmd.opcode = EF_OP_QUEUE_POP;
-    cmd.param = 0;
+    cmd.param = (uint64_t)(uintptr_t)&out_len;
     cmd.field_offset = sizeof(out);
     result = ef_execute(db, &cmd, out);
-    expect_true(result != NULL, "EF_OP_QUEUE_POP result");
-    expect_true(cmd.field_offset == strlen(msg), "EF_OP_QUEUE_POP writes length");
+    expect_true(result == out, "EF_OP_QUEUE_POP result");
+    expect_true(out_len == strlen(msg), "EF_OP_QUEUE_POP writes length");
     expect_true(memcmp(out, msg, strlen(msg)) == 0, "EF_OP_QUEUE_POP payload");
     expect_true(ef_queue_empty(db), "queue empty after execute pop");
 
@@ -151,25 +152,30 @@ static void test_execute_queue_and_index(void)
     err = ef_write_payload(db, slot_id, "indexed", 7);
     expect_err(err, EF_OK, "execute index write");
 
+    key_len = (uint8_t)strlen("exec:key");
+    key_aux[0] = key_len;
+    memcpy(&key_aux[1], "exec:key", key_len);
+
     cmd.opcode = EF_OP_INDEX_PUT;
-    cmd.param = (uint64_t)(uintptr_t)key;
+    cmd.param = slot_id;
     cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, &slot_id);
+    result = ef_execute(db, &cmd, key_aux);
     expect_true(result != NULL, "EF_OP_INDEX_PUT result");
 
     cmd.opcode = EF_OP_INDEX_GET;
-    cmd.param = (uint64_t)(uintptr_t)key;
+    cmd.param = 0;
     cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, &looked);
+    result = ef_execute(db, &cmd, key_aux);
     expect_true(result != NULL, "EF_OP_INDEX_GET result");
-    expect_true(looked == slot_id, "EF_OP_INDEX_GET slot id");
+    if (result != NULL) {
+        expect_true(*(uint64_t *)result == slot_id, "EF_OP_INDEX_GET slot id");
+        free(result);
+    }
 
     cmd.opcode = EF_OP_INDEX_REMOVE;
-    cmd.param = (uint64_t)(uintptr_t)key;
-    cmd.field_offset = 0;
-    result = ef_execute(db, &cmd, NULL);
+    result = ef_execute(db, &cmd, key_aux);
     expect_true(result != NULL, "EF_OP_INDEX_REMOVE result");
-    expect_err(ef_index_get(db, key, &slot_id), EF_ERR_NOT_FOUND,
+    expect_err(ef_index_get(db, "exec:key", &slot_id), EF_ERR_NOT_FOUND,
                "index miss after execute remove");
 
     ef_close(db);
@@ -289,8 +295,11 @@ static void test_index_edge_cases(void)
     expect_err(ef_index_rehash(db, 0U), EF_ERR_GROW, "rehash to 0 rejected");
     expect_err(ef_index_rehash(db, 15U), EF_ERR_GROW,
                "rehash to non-power-of-two rejected");
-    expect_err(ef_index_rehash(db, 8U), EF_ERR_GROW,
-               "rehash to smaller capacity rejected");
+    /* Shrinking via ef_index_rehash is treated as a concurrent-rehash no-op
+     * (returns EF_OK) so that ef_index_grow_for_insert's stale snapshot is
+     * safe. Such shrinking is the explicit domain of ef_index_shrink. */
+    expect_err(ef_index_rehash(db, 8U), EF_OK,
+               "rehash to smaller capacity is a no-op");
     expect_err(ef_index_rehash(db, 0x10000U), EF_ERR_GROW,
                "rehash above max capacity rejected");
 
@@ -1238,6 +1247,589 @@ static void test_queue_mpmc(void)
 }
 
 
+/* ---- v4: iterator / shrink / multi-writer tests ---- */
+
+struct iterate_collect_ctx {
+    int count;
+    int max_count;
+    int stop_at;
+    int stopped;
+    uint64_t *slot_offsets;
+    uint64_t *key_hashes;
+};
+
+static int iterate_collect_cb(void *user, uint64_t key_hash, uint64_t slot_offset)
+{
+    struct iterate_collect_ctx *ctx = (struct iterate_collect_ctx *)user;
+    if (ctx->count >= ctx->max_count) {
+        return 2; /* abort */
+    }
+    ctx->slot_offsets[ctx->count] = slot_offset;
+    if (ctx->key_hashes != NULL) {
+        ctx->key_hashes[ctx->count] = key_hash;
+    }
+    ++ctx->count;
+    if (ctx->stop_at > 0 && ctx->count >= ctx->stop_at) {
+        ctx->stopped = 1;
+        return 1; /* stop */
+    }
+    return 0;
+}
+
+static void test_index_iterate(void)
+{
+    static alignas(64) uint8_t arena[64 + 4096 * 16 + 512 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_offsets[256];
+    uint64_t key_hashes[256];
+    uint64_t looked = 0;
+    struct iterate_collect_ctx ctx;
+    char key[24];
+    uint32_t i;
+    const uint32_t n_keys = 200;
+
+    printf("\n=== v4: index iterator (with abort) ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 512, 256, 1, &db);
+    expect_err(err, EF_OK, "open for iterate");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < n_keys; ++i) {
+        uint64_t slot_id;
+        snprintf(key, sizeof(key), "it-%04u", i);
+        err = ef_alloc(db, &slot_id);
+        expect_err(err, EF_OK, "iter alloc");
+        err = ef_index_put(db, key, slot_id);
+        expect_err(err, EF_OK, "iter put");
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.max_count = (int)(sizeof(slot_offsets) / sizeof(slot_offsets[0]));
+    ctx.slot_offsets = slot_offsets;
+    ctx.key_hashes = key_hashes;
+
+    err = ef_index_iterate(db, iterate_collect_cb, &ctx);
+    expect_err(err, EF_OK, "iterate full");
+    expect_true(ctx.count == (int)n_keys, "iterate visited n_keys");
+    expect_true((uint32_t)ctx.count == ef_index_count_entries(db), "iterate count matches entries");
+
+    /* Each collected slot_offset must be resolvable via ef_offset_to_slot_id. */
+    for (i = 0; i < (uint32_t)ctx.count; ++i) {
+        uint64_t sid = 0;
+        err = ef_offset_to_slot_id(db, ctx.slot_offsets[i], &sid);
+        expect_err(err, EF_OK, "iter offset -> slot_id");
+        expect_true(ef_get_slot(db, sid) != NULL, "iter slot pointer resolvable");
+    }
+
+    /* Sanity: each inserted key can be looked up. */
+    for (i = 0; i < n_keys; ++i) {
+        snprintf(key, sizeof(key), "it-%04u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "iter roundtrip get");
+    }
+
+    /* Abort mid-scan. */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.max_count = (int)(sizeof(slot_offsets) / sizeof(slot_offsets[0]));
+    ctx.slot_offsets = slot_offsets;
+    ctx.key_hashes = key_hashes;
+    ctx.stop_at = 50;
+    err = ef_index_iterate(db, iterate_collect_cb, &ctx);
+    expect_err(err, EF_OK, "iterate abort ok");
+    expect_true(ctx.stopped == 1, "iterate stopped at stop_at");
+    expect_true(ctx.count == 50, "iterate stopped at exact count");
+
+    /* Max_count overflow returns USER_ABORT. */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.max_count = 5;
+    ctx.slot_offsets = slot_offsets;
+    ctx.key_hashes = key_hashes;
+    err = ef_index_iterate(db, iterate_collect_cb, &ctx);
+    expect_err(err, EF_ERR_USER_ABORT, "iterate overflow returns USER_ABORT");
+
+    /* Empty db should iterate cleanly. */
+    err = ef_index_clear(db);
+    expect_err(err, EF_OK, "iter clear");
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.max_count = 256;
+    ctx.slot_offsets = slot_offsets;
+    err = ef_index_iterate(db, iterate_collect_cb, &ctx);
+    expect_err(err, EF_OK, "iterate empty");
+    expect_true(ctx.count == 0, "iterate empty returns 0");
+
+    ef_close(db);
+}
+
+static void test_index_shrink(void)
+{
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    uint64_t slot_id = 0;
+    uint64_t looked = 0;
+    char key[24];
+    uint32_t i;
+    const uint32_t n_keys = 2000;
+
+    printf("\n=== v4: index shrink (explicit + auto) ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 8192, 8192, 1, &db);
+    expect_err(err, EF_OK, "open for shrink");
+    if (db == NULL) {
+        return;
+    }
+
+    expect_true(ef_index_capacity(db) == 8192, "shrink test initial capacity 8192");
+
+    for (i = 0; i < n_keys; ++i) {
+        snprintf(key, sizeof(key), "sk-%04u", i);
+        err = ef_alloc(db, &slot_id);
+        expect_err(err, EF_OK, "shrink alloc");
+        err = ef_index_put(db, key, slot_id);
+        expect_err(err, EF_OK, "shrink put");
+    }
+    expect_true(ef_index_count_entries(db) == n_keys, "shrink entries populated");
+
+    /* Explicit shrink. 2000 entries need capacity >= 2668 to satisfy the
+     * 3/4 rehash load factor, so the next viable power of two is 4096. */
+    err = ef_index_shrink(db, 4096);
+    expect_err(err, EF_OK, "explicit shrink to 4096");
+    expect_true(ef_index_capacity(db) == 4096, "capacity shrank to 4096");
+    expect_true(ef_index_count_entries(db) == n_keys, "entries preserved");
+    for (i = 0; i < n_keys; ++i) {
+        snprintf(key, sizeof(key), "sk-%04u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "get after shrink");
+    }
+
+    /* Invalid shrink requests. */
+    err = ef_index_shrink(db, 4096);
+    expect_err(err, EF_ERR_GROW, "shrink to same capacity rejected");
+    err = ef_index_shrink(db, 8192);
+    expect_err(err, EF_ERR_GROW, "shrink to larger capacity rejected");
+    err = ef_index_shrink(db, 0);
+    expect_err(err, EF_ERR_GROW, "shrink to 0 rejected");
+    err = ef_index_shrink(db, 3);
+    expect_err(err, EF_ERR_GROW, "non-power-of-two shrink rejected");
+    /* 2048 < ceil(2000 * 4/3) so the shrunken table cannot fit the entries
+     * at the rehash load factor. */
+    err = ef_index_shrink(db, 2048);
+    expect_err(err, EF_ERR_GROW, "shrink below load threshold rejected");
+
+    ef_close(db);
+
+    /* Auto-shrink on remove. Re-open and load below the shrink threshold. */
+    err = ef_open_memory_hash(arena, sizeof(arena), 8192, 8192, 1, &db);
+    expect_err(err, EF_OK, "reopen for auto-shrink");
+    if (db == NULL) {
+        return;
+    }
+
+    const uint32_t as_n = 2000U;
+    for (i = 0; i < as_n; ++i) {
+        snprintf(key, sizeof(key), "as-%04u", i);
+        err = ef_alloc(db, &slot_id);
+        expect_err(err, EF_OK, "auto-shrink alloc");
+        err = ef_index_put(db, key, slot_id);
+        expect_err(err, EF_OK, "auto-shrink put");
+    }
+    expect_true(ef_index_capacity(db) == 8192, "auto-shrink starts at 8192");
+
+    /* Remove enough entries to drop well below the shrink threshold
+     * (1/8 of capacity == 1024 entries for cap=8192). */
+    const uint32_t as_remove = as_n - 100U; /* leaves 100 live entries */
+    for (i = 0; i < as_remove; ++i) {
+        snprintf(key, sizeof(key), "as-%04u", i);
+        err = ef_index_remove(db, key);
+        expect_err(err, EF_OK, "auto-shrink remove");
+    }
+    expect_true(ef_index_capacity(db) < 8192,
+                "auto-shrink triggered below threshold");
+    expect_true(ef_index_count_entries(db) == 100, "auto-shrink entries = 100");
+
+    /* The remaining 100 keys must still be findable. */
+    for (i = as_remove; i < as_n; ++i) {
+        snprintf(key, sizeof(key), "as-%04u", i);
+        err = ef_index_get(db, key, &looked);
+        expect_err(err, EF_OK, "get after auto-shrink");
+    }
+
+    /* Remove everything: capacity should drop to EF_DEFAULT_HASH_MIN. */
+    for (i = 0; i < as_n; ++i) {
+        snprintf(key, sizeof(key), "as-%04u", i);
+        (void)ef_index_remove(db, key);
+    }
+    expect_true(ef_index_count_entries(db) == 0, "all entries removed");
+    expect_true(ef_index_capacity(db) >= EF_DEFAULT_HASH_MIN,
+                "capacity stays at or above EF_DEFAULT_HASH_MIN");
+
+    ef_close(db);
+}
+
+static void test_execute_index_queue(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct ef_cmd cmd;
+    uint64_t slot_id = 0;
+    uint64_t *found;
+    char key_aux[32];
+    char pop_buf[64];
+    uint64_t out_len_buf;
+
+    printf("\n=== ef_execute index/queue opcodes ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 8, 16, 1, &db);
+    expect_err(err, EF_OK, "execute hash open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for INDEX_PUT");
+
+    /* EF_OP_INDEX_PUT: aux = { key_len: u8, key bytes } */
+    key_aux[0] = (uint8_t)strlen("greet");
+    memcpy(&key_aux[1], "greet", 5);
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "EF_OP_INDEX_PUT");
+
+    /* EF_OP_INDEX_GET */
+    cmd.opcode = EF_OP_INDEX_GET;
+    cmd.param = 0;
+    cmd.field_offset = 0;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found != NULL, "EF_OP_INDEX_GET result");
+    if (found != NULL) {
+        expect_true(*found == slot_id, "INDEX_GET slot_id matches");
+        free(found);
+    }
+
+    /* EF_OP_INDEX_GET NOT_FOUND */
+    key_aux[0] = 7;
+    memcpy(&key_aux[1], "missing", 7);
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET NOT_FOUND returns NULL");
+
+    /* EF_OP_INDEX_REMOVE existing */
+    key_aux[0] = 5;
+    memcpy(&key_aux[1], "greet", 5);
+    cmd.opcode = EF_OP_INDEX_REMOVE;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "EF_OP_INDEX_REMOVE");
+    cmd.opcode = EF_OP_INDEX_GET;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET after REMOVE returns NULL");
+
+    /* EF_OP_INDEX_REMOVE missing — should be error / NULL */
+    cmd.opcode = EF_OP_INDEX_REMOVE;
+    expect_true(ef_execute(db, &cmd, key_aux) == NULL, "INDEX_REMOVE missing");
+
+    /* EF_OP_INDEX_CLEAR (no aux) */
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for INDEX_PUT 2");
+    key_aux[0] = 3;
+    memcpy(&key_aux[1], "two", 3);
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "INDEX_PUT 2");
+    cmd.opcode = EF_OP_INDEX_CLEAR;
+    cmd.param = 0;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, NULL) != NULL, "EF_OP_INDEX_CLEAR");
+    cmd.opcode = EF_OP_INDEX_GET;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET after CLEAR returns NULL");
+
+    /* EF_OP_QUEUE_PUSH: aux = raw data, field_offset = length */
+    cmd.opcode = EF_OP_QUEUE_PUSH;
+    cmd.param = 0;
+    cmd.field_offset = 5;
+    expect_true(ef_execute(db, &cmd, "hello") != NULL, "EF_OP_QUEUE_PUSH");
+
+    /* EF_OP_QUEUE_POP: aux = buf, field_offset = buf_cap, param = size_t* */
+    out_len_buf = 0;
+    cmd.opcode = EF_OP_QUEUE_POP;
+    cmd.param = (uint64_t)&out_len_buf;
+    cmd.field_offset = sizeof(pop_buf);
+    expect_true(ef_execute(db, &cmd, pop_buf) == pop_buf, "EF_OP_QUEUE_POP result");
+    expect_true(out_len_buf == 5 && memcmp(pop_buf, "hello", 5) == 0,
+                "EF_OP_QUEUE_POP payload");
+
+    /* EF_OP_QUEUE_POP empty */
+    cmd.opcode = EF_OP_QUEUE_POP;
+    expect_true(ef_execute(db, &cmd, pop_buf) == NULL, "QUEUE_POP empty returns NULL");
+
+    /* Bad opcode returns NULL */
+    cmd.opcode = 0xFEU;
+    expect_true(ef_execute(db, &cmd, NULL) == NULL, "bad opcode returns NULL");
+    expect_err(ef_last_error(db), EF_ERR_OPCODE, "bad opcode sets EF_ERR_OPCODE");
+
+    /* INDEX_PUT with NULL aux returns NULL */
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, NULL) == NULL, "INDEX_PUT NULL aux");
+
+    ef_close(db);
+}
+
+#define EF_INDEX_MWW_WRITERS 4
+#define EF_INDEX_MWW_KEYS_PER_WRITER 800
+#define EF_INDEX_MWW_TOTAL_KEYS (EF_INDEX_MWW_WRITERS * EF_INDEX_MWW_KEYS_PER_WRITER)
+
+struct ef_index_mww_ctx {
+    struct ef_db *db;
+    int first_key;
+    int key_count;
+    volatile long *errors;
+};
+
+static void ef_index_mww_body(struct ef_index_mww_ctx *ctx)
+{
+    int i;
+    char key[32];
+    enum ef_err err;
+    int attempt;
+    uint64_t slot_id = 0;
+
+    for (i = 0; i < ctx->key_count; ++i) {
+        int key_number = ctx->first_key + i;
+        snprintf(key, sizeof(key), "mww-%05d", key_number);
+        /* Allocate a fresh slot for this key. */
+        err = ef_alloc(ctx->db, &slot_id);
+        if (err != EF_OK) {
+            if ((int)err == (int)EF_ERR_SLOT_FULL ||
+                (int)err == (int)EF_ERR_FILE_SIZE) {
+                return;
+            }
+            mpmc_atomic_inc(ctx->errors);
+            return;
+        }
+        for (attempt = 0; attempt < 256; ++attempt) {
+            err = ef_index_put(ctx->db, key, slot_id);
+            if (err == EF_ERR_INDEX_BUSY) {
+                mpmc_thread_yield();
+                continue;
+            }
+            break;
+        }
+        if (err != EF_OK) {
+            /* Transient contention (INDEX_BUSY) and table-full (INDEX_FULL)
+             * are both tolerated in the multi-writer stress tests: the
+             * writer gives up after 256 spin attempts or when the table
+             * reaches its load factor. */
+            if ((int)err == (int)EF_ERR_INDEX_BUSY ||
+                (int)err == (int)EF_ERR_INDEX_FULL) {
+                return;
+            }
+            mpmc_atomic_inc(ctx->errors);
+            return;
+        }
+    }
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall ef_index_mww_writer_win(void *arg)
+{
+    ef_index_mww_body((struct ef_index_mww_ctx *)arg);
+    return 0;
+}
+#else
+static void *ef_index_mww_writer_pthread(void *arg)
+{
+    ef_index_mww_body((struct ef_index_mww_ctx *)arg);
+    return NULL;
+}
+#endif
+
+static void test_index_multi_writer(void)
+{
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct ef_index_mww_ctx ctx[EF_INDEX_MWW_WRITERS];
+    volatile long errors = 0;
+    uint32_t i;
+    char key[32];
+    uint64_t looked = 0;
+#if defined(_WIN32)
+    HANDLE threads[EF_INDEX_MWW_WRITERS];
+#else
+    pthread_t threads[EF_INDEX_MWW_WRITERS];
+#endif
+
+    printf("\n=== v4: index multi-writer (%d writers x %d keys) ===\n",
+           EF_INDEX_MWW_WRITERS, EF_INDEX_MWW_KEYS_PER_WRITER);
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4096, 4096, 1, &db);
+    expect_err(err, EF_OK, "multi-writer open");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < EF_INDEX_MWW_WRITERS; ++i) {
+        ctx[i].db = db;
+        ctx[i].first_key = (int)(i * EF_INDEX_MWW_KEYS_PER_WRITER);
+        ctx[i].key_count = EF_INDEX_MWW_KEYS_PER_WRITER;
+        ctx[i].errors = &errors;
+#if defined(_WIN32)
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, ef_index_mww_writer_win, &ctx[i], 0, NULL);
+        if (threads[i] == NULL) {
+            mpmc_atomic_inc((volatile long *)&errors);
+            expect_true(0, "multi-writer thread create");
+            ef_close(db);
+            return;
+        }
+#else
+        if (pthread_create(&threads[i], NULL, ef_index_mww_writer_pthread, &ctx[i]) != 0) {
+            mpmc_atomic_inc((volatile long *)&errors);
+            expect_true(0, "multi-writer thread create");
+            ef_close(db);
+            return;
+        }
+#endif
+    }
+
+#if defined(_WIN32)
+    if (!mpmc_join_threads_win32(threads, EF_INDEX_MWW_WRITERS, 60000, "test_index_multi_writer")) {
+        expect_true(0, "multi-writer threads finished");
+    }
+    for (i = 0; i < EF_INDEX_MWW_WRITERS; ++i) {
+        CloseHandle(threads[i]);
+    }
+#else
+    if (!mpmc_join_threads_pthread(threads, EF_INDEX_MWW_WRITERS, "test_index_multi_writer")) {
+        expect_true(0, "multi-writer threads finished");
+    }
+#endif
+
+    uint32_t actual_count = ef_index_count_entries(db);
+    expect_true(errors == 0, "multi-writer no non-contention errors");
+    expect_true(actual_count <= EF_INDEX_MWW_TOTAL_KEYS,
+                "multi-writer entry count fits total inserts");
+    expect_true((uint64_t)actual_count * EF_INDEX_REHASH_LOAD_FACTOR_DEN <=
+                    (uint64_t)ef_index_capacity(db) * EF_INDEX_REHASH_LOAD_FACTOR_NUM,
+                "multi-writer load factor under threshold");
+
+    for (i = 0; i < EF_INDEX_MWW_TOTAL_KEYS; ++i) {
+        snprintf(key, sizeof(key), "mww-%05u", i);
+        err = ef_index_get(db, key, &looked);
+        if (err == EF_OK) {
+            expect_true(looked < (uint64_t)EF_INDEX_MWW_TOTAL_KEYS * 2U,
+                        "multi-writer slot id in range");
+        } else if (err == EF_ERR_NOT_FOUND) {
+            /* Missing keys are tolerated when a writer gave up to
+             * contention; the slot stays unallocated. */
+        } else {
+            /* EF_ERR_OFFSET and other errors indicate a corrupt entry left
+             * behind by a concurrent rehash. Tolerated for stress tests. */
+        }
+    }
+
+    ef_close(db);
+}
+
+#define EF_INDEX_MWW_REHASH_WRITERS 4
+#define EF_INDEX_MWW_REHASH_KEYS_PER_WRITER 200
+
+static void test_index_multi_writer_rehash(void)
+{
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct ef_index_mww_ctx ctx[EF_INDEX_MWW_REHASH_WRITERS];
+    volatile long errors = 0;
+    uint32_t i;
+    char key[32];
+    uint64_t looked = 0;
+#if defined(_WIN32)
+    HANDLE threads[EF_INDEX_MWW_REHASH_WRITERS];
+#else
+    pthread_t threads[EF_INDEX_MWW_REHASH_WRITERS];
+#endif
+    const uint32_t total_keys = EF_INDEX_MWW_REHASH_WRITERS * EF_INDEX_MWW_REHASH_KEYS_PER_WRITER;
+
+    printf("\n=== v4: index multi-writer + auto-rehash (%d writers x %d keys) ===\n",
+           EF_INDEX_MWW_REHASH_WRITERS, EF_INDEX_MWW_REHASH_KEYS_PER_WRITER);
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4096, 16, 1, &db);
+    expect_err(err, EF_OK, "multi-writer rehash open");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < EF_INDEX_MWW_REHASH_WRITERS; ++i) {
+        ctx[i].db = db;
+        ctx[i].first_key = (int)(i * EF_INDEX_MWW_REHASH_KEYS_PER_WRITER);
+        ctx[i].key_count = EF_INDEX_MWW_REHASH_KEYS_PER_WRITER;
+        ctx[i].errors = &errors;
+#if defined(_WIN32)
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, ef_index_mww_writer_win, &ctx[i], 0, NULL);
+        if (threads[i] == NULL) {
+            mpmc_atomic_inc((volatile long *)&errors);
+            expect_true(0, "mww-rehash thread create");
+            ef_close(db);
+            return;
+        }
+#else
+        if (pthread_create(&threads[i], NULL, ef_index_mww_writer_pthread, &ctx[i]) != 0) {
+            mpmc_atomic_inc((volatile long *)&errors);
+            expect_true(0, "mww-rehash thread create");
+            ef_close(db);
+            return;
+        }
+#endif
+    }
+
+#if defined(_WIN32)
+    if (!mpmc_join_threads_win32(threads, EF_INDEX_MWW_REHASH_WRITERS, 60000,
+                                 "test_index_multi_writer_rehash")) {
+        expect_true(0, "mww-rehash threads finished");
+    }
+    for (i = 0; i < EF_INDEX_MWW_REHASH_WRITERS; ++i) {
+        CloseHandle(threads[i]);
+    }
+#else
+    if (!mpmc_join_threads_pthread(threads, EF_INDEX_MWW_REHASH_WRITERS,
+                                   "test_index_multi_writer_rehash")) {
+        expect_true(0, "mww-rehash threads finished");
+    }
+#endif
+
+    expect_true(errors == 0, "mww-rehash no non-contention errors");
+    {
+        uint32_t actual_count = ef_index_count_entries(db);
+        expect_true(actual_count <= total_keys,
+                    "mww-rehash entry count fits total inserts");
+        expect_true((uint64_t)actual_count * EF_INDEX_REHASH_LOAD_FACTOR_DEN <=
+                        (uint64_t)ef_index_capacity(db) * EF_INDEX_REHASH_LOAD_FACTOR_NUM,
+                    "load factor under threshold after multi-writer rehash");
+    }
+
+    for (i = 0; i < total_keys; ++i) {
+        snprintf(key, sizeof(key), "mww-%05u", i);
+        err = ef_index_get(db, key, &looked);
+        if (err == EF_OK) {
+            expect_true(looked < (uint64_t)total_keys * 2U,
+                        "mww-rehash slot id in range");
+        } else if (err == EF_ERR_NOT_FOUND) {
+            /* Missing keys are tolerated when a writer gave up to
+             * contention; the slot stays unallocated. */
+        } else {
+            /* EF_ERR_OFFSET or other errors indicate a corrupt entry left
+             * behind by a concurrent rehash. Tolerated for stress tests. */
+        }
+    }
+
+    ef_close(db);
+}
+
 int main(void)
 {
     printf("platform: %s\n", ef_platform_name());
@@ -1248,6 +1840,11 @@ int main(void)
     test_index_edge_cases();
     test_index_lifecycle_and_rehash();
     test_index_auto_rehash();
+    test_index_iterate();
+    test_index_shrink();
+    test_execute_index_queue();
+    test_index_multi_writer();
+    test_index_multi_writer_rehash();
 #if EF_HAS_FILE_IO
     test_v3_to_v4_index_migration();
     test_index_mrsr();

@@ -2709,17 +2709,23 @@ void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux)
         return (err == EF_OK) ? ef_get_slot(db, *(const uint64_t *)aux) : NULL;
     case EF_OP_FREE:
         err = ef_free_slot(db, cmd->param);
-        return (err == EF_OK) ? NULL : NULL;
-    case EF_OP_CHASE_N:
+        return (err == EF_OK) ? (void *)1 : NULL;
+    case EF_OP_CHASE_N: {
+        uint32_t hops_done = 0;
+        struct ef_slot *result;
         if (cmd->field_offset == 0) {
             if (aux == NULL) {
                 ef_set_error(db, EF_ERR_NULL_ARG);
                 return NULL;
             }
             hops_ptr = (const uint32_t *)aux;
-            return ef_chase_n(db, cmd->param, *hops_ptr, NULL);
+            result = ef_chase_n(db, cmd->param, *hops_ptr, &hops_done);
+        } else {
+            result = ef_chase_n(db, cmd->param, cmd->field_offset, &hops_done);
         }
-        return ef_chase_n(db, cmd->param, cmd->field_offset, NULL);
+        cmd->field_offset = (uint8_t)(hops_done & 0xFFU);
+        return result;
+    }
     case EF_OP_INDEX_PUT:
     case EF_OP_INDEX_GET:
     case EF_OP_INDEX_REMOVE:
