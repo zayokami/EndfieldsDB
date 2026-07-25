@@ -28,6 +28,15 @@
 #define EF_OP_ALLOC         0x08U
 #define EF_OP_FREE          0x09U
 #define EF_OP_CHASE_N       0x0AU
+/* Index and queue opcodes. aux carries a leading key_len (uint8_t) followed
+ * by the key bytes for INDEX_*; QUEUE_PUSH/POP treat aux as raw data buffer
+ * (field_offset = length or capacity). */
+#define EF_OP_INDEX_PUT     0x10U
+#define EF_OP_INDEX_GET     0x11U
+#define EF_OP_INDEX_REMOVE  0x12U
+#define EF_OP_INDEX_CLEAR   0x13U
+#define EF_OP_QUEUE_PUSH    0x14U
+#define EF_OP_QUEUE_POP     0x15U
 
 #define EF_STATUS_FREE 0U
 #define EF_STATUS_USED 1U

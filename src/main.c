@@ -1343,6 +1343,116 @@ static void test_v3_alloc_queue_index(void)
 #endif
 }
 
+static void test_execute_index_queue(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct ef_cmd cmd;
+    uint64_t slot_id = 0;
+    uint64_t *found;
+    char key_aux[32];
+    char pop_buf[64];
+    uint64_t out_len_buf;
+
+    printf("\n=== ef_execute index/queue opcodes ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 8, 16, 1, &db);
+    expect_err(err, EF_OK, "execute hash open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for INDEX_PUT");
+
+    /* EF_OP_INDEX_PUT: aux = { key_len: u8, key bytes } */
+    key_aux[0] = (uint8_t)strlen("greet");
+    memcpy(&key_aux[1], "greet", 5);
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "EF_OP_INDEX_PUT");
+
+    /* EF_OP_INDEX_GET */
+    cmd.opcode = EF_OP_INDEX_GET;
+    cmd.param = 0;
+    cmd.field_offset = 0;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found != NULL, "EF_OP_INDEX_GET result");
+    if (found != NULL) {
+        expect_true(*found == slot_id, "INDEX_GET slot_id matches");
+        free(found);
+    }
+
+    /* EF_OP_INDEX_GET NOT_FOUND */
+    key_aux[0] = 7;
+    memcpy(&key_aux[1], "missing", 7);
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET NOT_FOUND returns NULL");
+
+    /* EF_OP_INDEX_REMOVE existing */
+    key_aux[0] = 5;
+    memcpy(&key_aux[1], "greet", 5);
+    cmd.opcode = EF_OP_INDEX_REMOVE;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "EF_OP_INDEX_REMOVE");
+    cmd.opcode = EF_OP_INDEX_GET;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET after REMOVE returns NULL");
+
+    /* EF_OP_INDEX_REMOVE missing — should be error / NULL */
+    cmd.opcode = EF_OP_INDEX_REMOVE;
+    expect_true(ef_execute(db, &cmd, key_aux) == NULL, "INDEX_REMOVE missing");
+
+    /* EF_OP_INDEX_CLEAR (no aux) */
+    err = ef_alloc_slot(db, &slot_id);
+    expect_err(err, EF_OK, "alloc for INDEX_PUT 2");
+    key_aux[0] = 3;
+    memcpy(&key_aux[1], "two", 3);
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    expect_true(ef_execute(db, &cmd, key_aux) != NULL, "INDEX_PUT 2");
+    cmd.opcode = EF_OP_INDEX_CLEAR;
+    cmd.param = 0;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, NULL) != NULL, "EF_OP_INDEX_CLEAR");
+    cmd.opcode = EF_OP_INDEX_GET;
+    found = (uint64_t *)ef_execute(db, &cmd, key_aux);
+    expect_true(found == NULL, "INDEX_GET after CLEAR returns NULL");
+
+    /* EF_OP_QUEUE_PUSH: aux = raw data, field_offset = length */
+    cmd.opcode = EF_OP_QUEUE_PUSH;
+    cmd.param = 0;
+    cmd.field_offset = 5;
+    expect_true(ef_execute(db, &cmd, "hello") != NULL, "EF_OP_QUEUE_PUSH");
+
+    /* EF_OP_QUEUE_POP: aux = buf, field_offset = buf_cap, param = size_t* */
+    out_len_buf = 0;
+    cmd.opcode = EF_OP_QUEUE_POP;
+    cmd.param = (uint64_t)&out_len_buf;
+    cmd.field_offset = sizeof(pop_buf);
+    expect_true(ef_execute(db, &cmd, pop_buf) == pop_buf, "EF_OP_QUEUE_POP result");
+    expect_true(out_len_buf == 5 && memcmp(pop_buf, "hello", 5) == 0,
+                "EF_OP_QUEUE_POP payload");
+
+    /* EF_OP_QUEUE_POP empty */
+    cmd.opcode = EF_OP_QUEUE_POP;
+    expect_true(ef_execute(db, &cmd, pop_buf) == NULL, "QUEUE_POP empty returns NULL");
+
+    /* Bad opcode returns NULL */
+    cmd.opcode = 0xFEU;
+    expect_true(ef_execute(db, &cmd, NULL) == NULL, "bad opcode returns NULL");
+    expect_err(ef_last_error(db), EF_ERR_OPCODE, "bad opcode sets EF_ERR_OPCODE");
+
+    /* INDEX_PUT with NULL aux returns NULL */
+    cmd.opcode = EF_OP_INDEX_PUT;
+    cmd.param = slot_id;
+    cmd.field_offset = 0;
+    expect_true(ef_execute(db, &cmd, NULL) == NULL, "INDEX_PUT NULL aux");
+
+    ef_close(db);
+}
+
 static void test_index_lifecycle_and_rehash(void)
 {
     static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64];
@@ -3657,6 +3767,7 @@ int main(void)
     test_slot_header_crc_memory();
     test_v3_alloc_queue_index();
     test_index_lifecycle_and_rehash();
+    test_execute_index_queue();
     test_index_auto_rehash();
     test_index_iterate();
     test_index_shrink();
