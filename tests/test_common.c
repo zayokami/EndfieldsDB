@@ -75,3 +75,30 @@ int test_finish(const char *label)
     printf("%s passed.\n", label);
     return 0;
 }
+
+void begin_txn_or_fail(struct ef_db *db, const char *msg)
+{
+    enum ef_err err = ef_txn_begin(db);
+    if (err != EF_OK) {
+        fprintf(stderr, "FAIL: %s: ef_txn_begin -> %s\n", msg, ef_strerror(err));
+        ++g_failures;
+    }
+}
+
+void abort_txn_or_fail(struct ef_db *db, const char *msg)
+{
+    enum ef_err err = ef_txn_abort(db);
+    if (err != EF_OK) {
+        fprintf(stderr, "FAIL: %s: ef_txn_abort -> %s\n", msg, ef_strerror(err));
+        ++g_failures;
+    }
+}
+
+void commit_txn_or_fail(struct ef_db *db, const char *msg)
+{
+    enum ef_err err = ef_txn_commit(db);
+    if (err != EF_OK) {
+        fprintf(stderr, "FAIL: %s: ef_txn_commit -> %s\n", msg, ef_strerror(err));
+        ++g_failures;
+    }
+}

@@ -2,7 +2,7 @@
 
 static void test_v3_alloc_queue_index(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -112,7 +112,7 @@ static void test_v3_alloc_queue_index(void)
 
 static void test_execute_queue_and_index(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     struct ef_cmd cmd;
     enum ef_err err;
@@ -183,7 +183,7 @@ static void test_execute_queue_and_index(void)
 
 static void test_index_get_slot(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -239,8 +239,8 @@ static void test_index_get_slot(void)
 
 static void test_index_edge_cases(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
-    static alignas(64) uint8_t rehash_arena[64 + 64 * 16 + 128 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    static alignas(64) uint8_t rehash_arena[64 + 64 * 16 + 128 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_a = 0;
@@ -375,7 +375,7 @@ static void test_index_edge_cases(void)
 
 static void test_index_lifecycle_and_rehash(void)
 {
-    static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64];
+    static alignas(64) uint8_t arena[64 + 32 * 16 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -425,8 +425,8 @@ static void test_index_lifecycle_and_rehash(void)
 
 static void test_index_auto_rehash(void)
 {
-    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64];
-    static alignas(64) uint8_t tight_arena[64 + 16 * 16 + 32 * 64];
+    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    static alignas(64) uint8_t tight_arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slots[48];
@@ -1028,7 +1028,7 @@ static void test_sb_checksum_store(struct ef_superblock *sb)
 
 static void test_v3_to_v4_index_migration(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 8 * 64 + 32 + 4096 * 32];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -1070,7 +1070,7 @@ static void test_v3_to_v4_index_migration(void)
 
     expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "migrated schema v4");
     expect_true(db->hash_capacity == 16U, "migrated hash capacity");
-    expect_true(ef_sb_index_seq_load(db->sb) == 0U, "migrated index seq zero");
+    expect_true(ef_sb_index_seq_load(db) == 0U, "migrated index seq zero");
 
     err = ef_index_get(db, key, &looked);
     expect_err(err, EF_OK, "migration index lookup");
@@ -1081,7 +1081,7 @@ static void test_v3_to_v4_index_migration(void)
 
 static void test_index_mrsr(void)
 {
-    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64];
+    static alignas(64) uint8_t arena[64 + 64 * 16 + 128 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     struct ef_index_mrsr_ctx ctx[5];
@@ -1278,7 +1278,7 @@ static int iterate_collect_cb(void *user, uint64_t key_hash, uint64_t slot_offse
 
 static void test_index_iterate(void)
 {
-    static alignas(64) uint8_t arena[64 + 4096 * 16 + 512 * 64];
+    static alignas(64) uint8_t arena[64 + 4096 * 16 + 512 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_offsets[256];
@@ -1365,7 +1365,7 @@ static void test_index_iterate(void)
 
 static void test_index_shrink(void)
 {
-    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id = 0;
@@ -1471,7 +1471,7 @@ static void test_index_shrink(void)
 
 static void test_execute_index_queue(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     struct ef_cmd cmd;
@@ -1650,7 +1650,7 @@ static void *ef_index_mww_writer_pthread(void *arg)
 
 static void test_index_multi_writer(void)
 {
-    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     struct ef_index_mww_ctx ctx[EF_INDEX_MWW_WRITERS];
@@ -1740,7 +1740,7 @@ static void test_index_multi_writer(void)
 
 static void test_index_multi_writer_rehash(void)
 {
-    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64];
+    static alignas(64) uint8_t arena[64 + 16384 * 16 + 8192 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     struct ef_index_mww_ctx ctx[EF_INDEX_MWW_REHASH_WRITERS];
@@ -1830,6 +1830,213 @@ static void test_index_multi_writer_rehash(void)
     ef_close(db);
 }
 
+/* ===== v5 transaction tests for index/queue ===== */
+
+static void test_txn_queue_rollback(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    size_t i;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 16, 16, 1, &db);
+    expect_err(err, EF_OK, "txn queue rollback open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn queue begin");
+    for (i = 0; i < 3; ++i) {
+        char data[16];
+        snprintf(data, sizeof(data), "msg-%u", (unsigned)i);
+        err = ef_queue_push(db, data, 7);
+        expect_err(err, EF_OK, "txn queue push");
+    }
+    abort_txn_or_fail(db, "txn queue abort");
+
+    expect_true(ef_count_free_slots(db) == 16, "all slots free after queue abort");
+
+    ef_close(db);
+}
+
+static void test_txn_rehash_forbidden(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    enum ef_err err;
+    int i;
+    int hit_busy = 0;
+    char key[16];
+
+    /* Open with a small hash capacity so that putting will trigger rehash. */
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn rehash forbidden open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn rehash forbidden begin");
+    /* 3/4 load of capacity=16 is 12. Insert until rehash would trigger or
+     * we run out of slots. */
+    for (i = 0; i < 32; ++i) {
+        err = ef_alloc_slot(db, &sid);
+        if (err != EF_OK) {
+            break;
+        }
+        snprintf(key, sizeof(key), "k-%d", i);
+        err = ef_index_put(db, key, sid);
+        if (err == EF_ERR_INDEX_BUSY) {
+            hit_busy = 1;
+            break;
+        }
+    }
+    expect_true(hit_busy, "txn rehash rejected inside txn");
+    abort_txn_or_fail(db, "txn rehash forbidden abort");
+
+    ef_close(db);
+}
+
+struct shared_db {
+    struct ef_db *db;
+    int id;
+};
+
+#if defined(_WIN32)
+static unsigned __stdcall worker_run_txn(void *arg)
+{
+    struct shared_db *s = (struct shared_db *)arg;
+    int i;
+    char key[24];
+    for (i = 0; i < 50; ++i) {
+        uint64_t sid = 0;
+        enum ef_err err;
+        if (ef_txn_begin(s->db) != EF_OK) {
+            continue;
+        }
+        err = ef_alloc_slot(s->db, &sid);
+        if (err != EF_OK) {
+            (void)ef_txn_abort(s->db);
+            continue;
+        }
+        snprintf(key, sizeof(key), "w%d-k%d", s->id, i);
+        (void)ef_index_put(s->db, key, sid);
+        (void)ef_txn_commit(s->db);
+    }
+    return 0;
+}
+#else
+static void *worker_run_txn(void *arg)
+{
+    struct shared_db *s = (struct shared_db *)arg;
+    int i;
+    char key[24];
+    for (i = 0; i < 50; ++i) {
+        uint64_t sid = 0;
+        enum ef_err err;
+        if (ef_txn_begin(s->db) != EF_OK) {
+            continue;
+        }
+        err = ef_alloc_slot(s->db, &sid);
+        if (err != EF_OK) {
+            (void)ef_txn_abort(s->db);
+            continue;
+        }
+        snprintf(key, sizeof(key), "w%d-k%d", s->id, i);
+        (void)ef_index_put(s->db, key, sid);
+        (void)ef_txn_commit(s->db);
+    }
+    return NULL;
+}
+#endif
+
+static void test_txn_concurrent_serialized(void)
+{
+    static alignas(64) uint8_t arena[64 + 64 * 16 + 256 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    struct shared_db s0 = {NULL, 0};
+    struct shared_db s1 = {NULL, 1};
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 256, 64, 1, &db);
+    expect_err(err, EF_OK, "txn concurrent open");
+    if (db == NULL) {
+        return;
+    }
+
+    s0.db = db;
+    s1.db = db;
+#if defined(_WIN32)
+    {
+        uintptr_t t0 = _beginthreadex(NULL, 0, worker_run_txn, &s0, 0, NULL);
+        uintptr_t t1 = _beginthreadex(NULL, 0, worker_run_txn, &s1, 0, NULL);
+        if (t0 != 0) {
+            WaitForSingleObject((HANDLE)t0, INFINITE);
+            CloseHandle((HANDLE)t0);
+        }
+        if (t1 != 0) {
+            WaitForSingleObject((HANDLE)t1, INFINITE);
+            CloseHandle((HANDLE)t1);
+        }
+    }
+#else
+    {
+        pthread_t t0;
+        pthread_t t1;
+        pthread_create(&t0, NULL, worker_run_txn, &s0);
+        pthread_create(&t1, NULL, worker_run_txn, &s1);
+        pthread_join(t0, NULL);
+        pthread_join(t1, NULL);
+    }
+#endif
+
+    expect_true(ef_txn_active(db) == 0, "txn inactive after concurrent run");
+    expect_true(ef_count_free_slots(db) > 0, "free slots remain after concurrent run");
+
+    ef_close(db);
+}
+
+static void test_v4_to_v5_migration_open(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    /* Seed a v5 image with a known key, then strip it back to v4 by
+     * rewriting the schema_version + refreshing the superblock checksum
+     * so the validator accepts the v4 image. Reopen as v5 should auto-
+     * migrate and the original data should still be there. */
+    struct ef_db *db = NULL;
+    struct ef_superblock *sb;
+    uint64_t sid = 0;
+    enum ef_err err;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 16, 16, 1, &db);
+    expect_err(err, EF_OK, "v4->v5 seed open");
+    if (db == NULL) {
+        return;
+    }
+    err = ef_alloc_slot(db, &sid);
+    expect_err(err, EF_OK, "v4->v5 seed alloc");
+    err = ef_index_put(db, "seed-key", sid);
+    expect_err(err, EF_OK, "v4->v5 seed put");
+    ef_close(db);
+
+    /* Downgrade: mark schema_version=4 and refresh the superblock checksum
+     * so the v4 image validates. The undo log segment is still allocated
+     * (we keep the buffer large); the migration will re-zero it. */
+    sb = (struct ef_superblock *)arena;
+    sb->schema_version = 4U;
+    ef_sb_checksum_store(sb);
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 16, 16, 0, &db);
+    expect_err(err, EF_OK, "v4->v5 reopen migrates");
+    if (db == NULL) {
+        return;
+    }
+    expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "v4 upgraded to v5");
+    expect_true(db->undo_log_base != 0, "undo log base valid after migration");
+    expect_err(ef_index_get(db, "seed-key", &sid), EF_OK, "seed key survives migration");
+    ef_close(db);
+}
+
 int main(void)
 {
     printf("platform: %s\n", ef_platform_name());
@@ -1845,6 +2052,14 @@ int main(void)
     test_execute_index_queue();
     test_index_multi_writer();
     test_index_multi_writer_rehash();
+    test_txn_queue_rollback();
+    printf("  [txn queue rollback OK]\n");
+    test_txn_rehash_forbidden();
+    printf("  [txn rehash forbidden OK]\n");
+    test_txn_concurrent_serialized();
+    printf("  [txn concurrent serialized OK]\n");
+    test_v4_to_v5_migration_open();
+    printf("  [v4 to v5 migration OK]\n");
 #if EF_HAS_FILE_IO
     test_v3_to_v4_index_migration();
     test_index_mrsr();

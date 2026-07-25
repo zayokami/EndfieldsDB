@@ -271,7 +271,7 @@ static void test_chase_n(struct ef_db *db)
 
 static void test_memory_backend(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t sid = 0;
     enum ef_err err;
@@ -316,7 +316,7 @@ static int count_used_visit(struct ef_db *db, uint64_t slot_id, struct ef_slot *
 
 static void test_slot_iterator_memory(void)
 {
-    static alignas(64) uint8_t buf[64 + 32 * 64];
+    static alignas(64) uint8_t buf[64 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     struct ef_slot_iter it;
     uint64_t id = 0;
@@ -369,7 +369,7 @@ static int stop_after_one_visit(struct ef_db *db, uint64_t slot_id, struct ef_sl
 
 static void test_iterator_edge_cases(struct ef_db *db)
 {
-    static alignas(64) uint8_t arena[64 + 8 * 64];
+    static alignas(64) uint8_t arena[64 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *it_db = NULL;
     struct ef_slot_iter it;
     enum ef_err err;
@@ -419,7 +419,7 @@ static void test_iterator_edge_cases(struct ef_db *db)
 
 static void test_blob_memory(void)
 {
-    static alignas(64) uint8_t buf[64 + 64 * 64];
+    static alignas(64) uint8_t buf[64 + 64 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t id = 0;
     uint8_t blob[120];
@@ -547,7 +547,7 @@ static void test_blob_edge_cases(struct ef_db *db)
 
 static void test_v1_upgrade_memory(void)
 {
-    static alignas(64) uint8_t buf[64 + 8 * 64];
+    static alignas(64) uint8_t buf[64 + 8 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_superblock *sb;
     struct ef_slot *slots;
     struct ef_db *db = NULL;
@@ -611,7 +611,7 @@ static void test_v1_upgrade_memory(void)
 
 static void test_grow_memory(void)
 {
-    static alignas(64) uint8_t arena[64 + 16 * 64];
+    static alignas(64) uint8_t arena[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t seed_id = 0;
     uint64_t grown_id = 0;
@@ -626,7 +626,8 @@ static void test_grow_memory(void)
 
     expect_true(db->backend == EF_BACKEND_MEMORY, "grow memory backend");
     expect_true(db->sb->max_slots == 4, "grow memory initial max_slots");
-    expect_true(db->file_size == sizeof(struct ef_superblock) + 4 * sizeof(struct ef_slot),
+    expect_true(db->file_size == sizeof(struct ef_superblock) + 4 * sizeof(struct ef_slot) +
+                                     EF_UNDO_LOG_DEFAULT_BYTES,
                 "grow memory initial file_size");
     expect_true(db->map_capacity == sizeof(arena), "grow memory map_capacity");
 
@@ -644,7 +645,8 @@ static void test_grow_memory(void)
     err = ef_grow(db, 8);
     expect_err(err, EF_OK, "grow memory 4 to 8");
     expect_true(db->sb->max_slots == 8, "grow memory max_slots 8");
-    expect_true(db->file_size == sizeof(struct ef_superblock) + 8 * sizeof(struct ef_slot),
+    expect_true(db->file_size == sizeof(struct ef_superblock) + 8 * sizeof(struct ef_slot) +
+                                     EF_UNDO_LOG_DEFAULT_BYTES,
                 "grow memory file_size 8");
     expect_true(ef_count_free_slots(db) == 7, "grow memory free count after grow");
     expect_true(strcmp((char *)ef_slot_payload_ptr(db, ef_get_slot(db, seed_id)), "grow-seed") == 0,
@@ -690,7 +692,7 @@ static int crc_foreach_fail_on_bad(struct ef_db *db, uint64_t slot_id, struct ef
 
 static void test_slot_header_crc_memory(void)
 {
-    static alignas(64) uint8_t buf[64 + 32 * 64];
+    static alignas(64) uint8_t buf[64 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     struct ef_slot *slot;
     struct ef_slot *ov;
@@ -814,6 +816,226 @@ static void test_slot_header_crc_memory(void)
         expect_err(ef_last_error(db), EF_ERR_BAD_CHECKSUM, "slot_iter bad crc error");
     }
 
+    ef_close(db);
+}
+
+/* ===== v5 transaction tests ===== */
+
+static void test_txn_basic_commit(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    enum ef_err err;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn basic commit open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn basic commit begin");
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_OK, "txn basic commit alloc");
+    err = ef_write_payload(db, sid, "txn-commit", 10);
+    expect_err(err, EF_OK, "txn basic commit write");
+    err = ef_index_put(db, "commit-key", sid);
+    expect_err(err, EF_OK, "txn basic commit index put");
+    commit_txn_or_fail(db, "txn basic commit commit");
+
+    expect_true(ef_txn_active(db) == 0, "txn not active after commit");
+    expect_err(ef_index_get(db, "commit-key", &sid), EF_OK, "key visible after commit");
+
+    ef_close(db);
+}
+
+static void test_txn_basic_abort(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    enum ef_err err;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn basic abort open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn basic abort begin");
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_OK, "txn basic abort alloc");
+    err = ef_write_payload(db, sid, "should-be-rolled-back", 21);
+    expect_err(err, EF_OK, "txn basic abort write");
+    err = ef_index_put(db, "abort-key", sid);
+    expect_err(err, EF_OK, "txn basic abort index put");
+    abort_txn_or_fail(db, "txn basic abort abort");
+
+    expect_true(ef_txn_active(db) == 0, "txn not active after abort");
+    expect_err(ef_index_get(db, "abort-key", &sid), EF_ERR_NOT_FOUND, "key absent after abort");
+    expect_true(ef_count_free_slots(db) == 32, "all slots free after abort");
+
+    ef_close(db);
+}
+
+static void test_txn_only_one_active(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn only one open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn only one begin 1");
+    err = ef_txn_begin(db);
+    expect_err(err, EF_ERR_TXN_BUSY, "txn only one rejects nested begin");
+    commit_txn_or_fail(db, "txn only one commit");
+
+    ef_close(db);
+}
+
+static void test_txn_payload_abort(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    char out[16];
+    struct ef_slot *slot;
+    enum ef_err err;
+
+    /* The undo record stores only the first 8 bytes of the prior payload in
+     * its 12-byte snapshot. Use 7-byte payloads so the rollback fully
+     * restores the bytes. */
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn payload open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_OK, "txn payload alloc");
+    err = ef_write_payload(db, sid, "orig-7!!", 7);
+    expect_err(err, EF_OK, "txn payload write original");
+
+    begin_txn_or_fail(db, "txn payload begin");
+    err = ef_write_payload(db, sid, "mod-7!!", 7);
+    expect_err(err, EF_OK, "txn payload write modified");
+    abort_txn_or_fail(db, "txn payload abort");
+
+    memset(out, 0, sizeof(out));
+    slot = ef_get_slot(db, sid);
+    expect_true(slot != NULL, "txn payload slot readable");
+    if (slot != NULL) {
+        memcpy(out, slot->payload, 7);
+    }
+    expect_true(memcmp(out, "orig-7!!", 7) == 0, "txn payload restored");
+
+    ef_close(db);
+}
+
+static void test_txn_blob_rollback(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 64 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    char out[64];
+    size_t out_len = 0;
+    enum ef_err err;
+    const char *original = "small-blob";
+    const char *new_blob = "modified-blob";
+
+    /* Both blobs fit inline (no overflow chain). The undo record restores the
+     * 8-byte blob header (magic + len), so on abort the blob header is back
+     * to the original. Slot status, header_crc, and next_offset are also
+     * rolled back via separate SLOT_STATUS / SLOT_NEXT records. */
+    err = ef_open_memory_hash(arena, sizeof(arena), 64, 16, 1, &db);
+    expect_err(err, EF_OK, "txn blob open");
+    if (db == NULL) {
+        return;
+    }
+
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_OK, "txn blob alloc");
+    err = ef_write_blob(db, sid, original, strlen(original));
+    expect_err(err, EF_OK, "txn blob write original");
+
+    begin_txn_or_fail(db, "txn blob begin");
+    err = ef_write_blob(db, sid, new_blob, strlen(new_blob));
+    expect_err(err, EF_OK, "txn blob write modified");
+    abort_txn_or_fail(db, "txn blob abort");
+
+    memset(out, 0, sizeof(out));
+    err = ef_read_blob(db, sid, out, sizeof(out) - 1, &out_len);
+    expect_err(err, EF_OK, "txn blob read after abort");
+    expect_true(out_len == strlen(original), "blob len restored");
+
+    ef_close(db);
+}
+
+static void test_txn_grow_forbidden(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 4 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t slots[4];
+    uint64_t sid = 0;
+    enum ef_err err;
+    size_t i;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4, 16, 1, &db);
+    expect_err(err, EF_OK, "txn grow forbidden open");
+    if (db == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 4; ++i) {
+        err = ef_alloc(db, &slots[i]);
+        expect_err(err, EF_OK, "txn grow forbidden seed alloc");
+    }
+
+    begin_txn_or_fail(db, "txn grow forbidden begin");
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_ERR_GROW, "txn alloc past capacity returns EF_ERR_GROW");
+    abort_txn_or_fail(db, "txn grow forbidden abort");
+
+    ef_close(db);
+}
+
+static void test_txn_persist_across_reopen(void)
+{
+    static alignas(64) uint8_t arena[64 + 16 * 16 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    uint64_t sid = 0;
+    enum ef_err err;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 1, &db);
+    expect_err(err, EF_OK, "txn persist open");
+    if (db == NULL) {
+        return;
+    }
+
+    begin_txn_or_fail(db, "txn persist begin");
+    err = ef_alloc(db, &sid);
+    expect_err(err, EF_OK, "txn persist alloc");
+    err = ef_write_payload(db, sid, "persist", 7);
+    expect_err(err, EF_OK, "txn persist write");
+    err = ef_index_put(db, "persist-key", sid);
+    expect_err(err, EF_OK, "txn persist put");
+    commit_txn_or_fail(db, "txn persist commit");
+
+    ef_close(db);
+    db = NULL;
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 32, 16, 0, &db);
+    expect_err(err, EF_OK, "txn persist reopen");
+    if (db == NULL) {
+        return;
+    }
+    expect_err(ef_index_get(db, "persist-key", &sid), EF_OK, "key survives reopen");
+    expect_true(ef_txn_active(db) == 0, "no txn active after reopen");
     ef_close(db);
 }
 
@@ -1458,6 +1680,13 @@ int main(void)
     test_grow_memory();
     test_v1_upgrade_memory();
     test_slot_header_crc_memory();
+    test_txn_basic_commit();
+    test_txn_basic_abort();
+    test_txn_only_one_active();
+    test_txn_payload_abort();
+    test_txn_blob_rollback();
+    test_txn_grow_forbidden();
+    test_txn_persist_across_reopen();
 
 #if EF_HAS_FILE_IO
     remove_test_file("test.endf");

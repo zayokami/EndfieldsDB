@@ -112,8 +112,16 @@ enum ef_err {
     EF_ERR_QUEUE_BUSY,
     EF_ERR_INDEX_FULL,
     EF_ERR_INDEX_BUSY,
-    EF_ERR_USER_ABORT
+    EF_ERR_USER_ABORT,
+    EF_ERR_TXN_BUSY,
+    EF_ERR_TXN_LOG_FULL
 };
+
+#define EF_TXN_STATE_NONE    0U
+#define EF_TXN_STATE_ACTIVE  1U
+#define EF_TXN_STATE_ABORTING 2U
+
+#define EF_TXN_WRITER_NONE   0xFFFFFFFFU
 
 enum ef_backend {
     EF_BACKEND_NONE = 0,
@@ -122,6 +130,8 @@ enum ef_backend {
 };
 
 struct ef_hash_entry;
+struct ef_undo_record;
+struct ef_undo_header;
 
 struct ef_db {
     int fd;
@@ -138,6 +148,19 @@ struct ef_db {
     struct ef_hash_entry *hash_index;
     int readonly;
     uint8_t sb_meta_dirty;
+    /* v5 in-memory mirror of the index seqlock; reset to 0 on open. */
+    uint32_t index_seq;
+    /* v5 transaction subsystem. The undo log lives in the file mmap at
+     * undo_log_base (file-relative offset) and has undo_log_slots records. The
+     * transaction lock is shared with the superblock (reserved[24]). */
+    uint8_t txn_state;          /* EF_TXN_STATE_* */
+    uint8_t txn_active;         /* 1 between ef_txn_begin and ef_txn_commit/abort */
+    uint32_t txn_writer_pid;     /* process id of current writer (cross-process) */
+    uint64_t undo_log_base;     /* file-relative offset to undo header */
+    uint32_t undo_log_slots;    /* number of 32B records in the log */
+    uint64_t undo_tail;         /* current write offset, in bytes from undo_log_base */
+    uint32_t undo_record_count; /* current transaction's record count */
+    void *undo_log_mmap;        /* pointer to header for atomic access */
 #ifdef _WIN32
     void *map_handle;
 #endif
@@ -234,5 +257,38 @@ enum ef_err ef_db_commit_meta(struct ef_db *db);
 void ef_db_mark_meta_dirty(struct ef_db *db);
 
 void *ef_execute(struct ef_db *db, struct ef_cmd *cmd, const void *aux);
+
+/* ===========================================================================
+ * v5: Read-write transactions (Serializable isolation).
+ *
+ * Transactions cover the index, slots, blob, and FIFO queue subsystems. A
+ * transaction is bracketed by ef_txn_begin and ef_txn_commit/ef_txn_abort.
+ * All write APIs record undo information so that ef_txn_abort restores the
+ * database to its state at ef_txn_begin.
+ *
+ * Concurrency model: a single per-DB u8 transaction lock serializes active
+ * transactions. The lock is independent of the index write lock and queue
+ * lock, so other API paths (ef_index_get, ef_queue_pop) may still run while a
+ * transaction is active on a different thread, but no two transactions can
+ * overlap. In-process and cross-process serialization share the same lock
+ * byte. ef_txn_begin returns EF_ERR_TXN_BUSY if another transaction is active
+ * (or another process holds the lock); the caller should retry.
+ *
+ * Constraints inside a transaction:
+ *   - ef_grow / ef_alloc implicit grow is rejected (EF_ERR_GROW). Pre-size
+ *     the database with ef_alloc_ex grow fallback path before opening a txn.
+ *   - ef_index_put / ef_index_rehash / ef_index_shrink reject the auto-rehash
+ *     path (EF_ERR_INDEX_BUSY). The user must size the index up front.
+ *   - All other write APIs are accepted; reads proceed as usual.
+ *
+ * Crash recovery: if a transaction is left active across a process crash, the
+ * next open will detect txn_state == ACTIVE and replay the undo log to roll
+ * back, then clear the lock.
+ * ===========================================================================
+ */
+enum ef_err ef_txn_begin(struct ef_db *db);
+enum ef_err ef_txn_commit(struct ef_db *db);
+enum ef_err ef_txn_abort(struct ef_db *db);
+int ef_txn_active(const struct ef_db *db);
 
 #endif

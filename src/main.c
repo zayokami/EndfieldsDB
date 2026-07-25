@@ -2301,7 +2301,7 @@ static void test_v3_to_v4_index_migration(void)
 
     expect_true(db->sb->schema_version == EF_SCHEMA_VERSION, "migrated schema v4");
     expect_true(db->hash_capacity == 16U, "migrated hash capacity");
-    expect_true(ef_sb_index_seq_load(db->sb) == 0U, "migrated index seq zero");
+    expect_true(ef_sb_index_seq_load(db) == 0U, "migrated index seq zero");
 
     err = ef_index_get(db, key, &looked);
     expect_err(err, EF_OK, "migration index lookup");

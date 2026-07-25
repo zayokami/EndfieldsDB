@@ -6,6 +6,8 @@
 #include "ef_sb_layout.h"
 #include "ef_blob.h"
 #include "ef_internal.h"
+#include "ef_undo.h"
+#include "ef_txn.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -122,7 +124,7 @@ static const uint32_t *ef_sb_checksum_ptr_ro(const struct ef_superblock *sb)
     return (const uint32_t *)&sb->reserved[0];
 }
 
-static uint32_t ef_sb_checksum_compute(const struct ef_superblock *sb)
+uint32_t ef_sb_checksum_compute(const struct ef_superblock *sb)
 {
     uint32_t crc;
     uint32_t zero_crc = 0;
@@ -134,7 +136,7 @@ static uint32_t ef_sb_checksum_compute(const struct ef_superblock *sb)
     return crc ^ 0xFFFFFFFFU;
 }
 
-static void ef_sb_checksum_store(struct ef_superblock *sb)
+void ef_sb_checksum_store(struct ef_superblock *sb)
 {
     if (sb->flags & EF_FLAG_SB_CRC) {
         *ef_sb_checksum_ptr(sb) = ef_sb_checksum_compute(sb);
@@ -442,16 +444,20 @@ static int ef_magic_valid(const struct ef_superblock *sb)
            sb->magic[3] == EF_MAGIC_3;
 }
 
-size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity)
+size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity,
+                             uint32_t undo_log_slots)
 {
     return (size_t)(sizeof(struct ef_superblock) +
                     (uint64_t)hash_capacity * sizeof(struct ef_hash_entry) +
-                    max_slots * sizeof(struct ef_slot));
+                    max_slots * sizeof(struct ef_slot) +
+                    sizeof(struct ef_undo_header) +
+                    (uint64_t)undo_log_slots * 32U);
 }
 
 static void ef_db_bind_slots_layout(struct ef_db *db)
 {
     uint32_t hash_capacity;
+    uint64_t slots_end;
 
     if (db == NULL || db->sb == NULL || db->mmap_addr == NULL) {
         return;
@@ -469,6 +475,12 @@ static void ef_db_bind_slots_layout(struct ef_db *db)
         db->slots_base = (uint64_t)sizeof(struct ef_superblock);
     }
     db->slots = (struct ef_slot *)((uint8_t *)db->mmap_addr + db->slots_base);
+
+    /* v5: undo log segment sits after the slot area. */
+    slots_end = db->slots_base + (uint64_t)db->sb->max_slots * sizeof(struct ef_slot);
+    db->undo_log_base = slots_end;
+    db->undo_log_slots = EF_UNDO_LOG_DEFAULT_SLOTS;
+    db->undo_log_mmap = (uint8_t *)db->mmap_addr + slots_end;
 }
 
 void ef_db_bind_io(struct ef_db *db, const struct ef_io *io)
@@ -502,6 +514,7 @@ void ef_db_to_io(const struct ef_db *db, struct ef_io *io)
 static enum ef_err ef_validate_superblock(const struct ef_superblock *sb, size_t file_size)
 {
     size_t expected;
+    uint32_t undo_log_slots;
 
     if (sb == NULL) {
         return EF_ERR_NULL_ARG;
@@ -519,6 +532,7 @@ static enum ef_err ef_validate_superblock(const struct ef_superblock *sb, size_t
         sb->schema_version != EF_SCHEMA_LEGACY &&
         sb->schema_version != EF_SCHEMA_VERSION_V2 &&
         sb->schema_version != EF_SCHEMA_VERSION_V3 &&
+        sb->schema_version != EF_SCHEMA_VERSION_V4 &&
         sb->schema_version != EF_SCHEMA_VERSION) {
         return EF_ERR_BAD_VERSION;
     }
@@ -527,9 +541,24 @@ static enum ef_err ef_validate_superblock(const struct ef_superblock *sb, size_t
         return EF_ERR_BAD_VERSION;
     }
 
-    expected = ef_expected_file_size(sb->max_slots, ef_hash_capacity_from_sb(sb));
-    if (file_size != expected) {
-        return EF_ERR_FILE_SIZE;
+    /* v5 files always include the default undo log segment; v3/v4 files do
+     * not (they will be migrated to v5 by ef_db_init_mapped after validation).
+     * Older files (v1/v2/legacy) may have already been pre-grown to the v5
+     * layout by ef_open_ex_hash, so accept file_size >= expected for any
+     * pre-v5 schema (the migration path will use the extra region as the
+     * undo log). v5 files must match exactly. */
+    undo_log_slots = (sb->schema_version == EF_SCHEMA_VERSION)
+                         ? EF_UNDO_LOG_DEFAULT_SLOTS
+                         : 0U;
+    expected = ef_expected_file_size(sb->max_slots, ef_hash_capacity_from_sb(sb), undo_log_slots);
+    if (sb->schema_version == EF_SCHEMA_VERSION) {
+        if (file_size != expected) {
+            return EF_ERR_FILE_SIZE;
+        }
+    } else {
+        if (file_size < expected) {
+            return EF_ERR_FILE_SIZE;
+        }
     }
 
     if (!ef_sb_checksum_valid(sb)) {
@@ -685,6 +714,9 @@ static enum ef_err ef_db_init_mapped(struct ef_db *db, int is_new_file, uint64_t
             /* Read-only mapping: use on-disk free list as-is; never write mmap. */
             return EF_OK;
         }
+        /* Bind layout before any v3/v4→v5 migration so that undo_log_slots
+         * is populated and post-migration zeroing hits the right region. */
+        ef_db_bind_slots_layout(db);
         if (db->sb->schema_version == EF_SCHEMA_VERSION_V3 &&
             ef_sb_hash_capacity_load(db->sb) > 0U) {
             err = ef_sb_migrate_v3_index_layout(db->sb);
@@ -694,9 +726,55 @@ static enum ef_err ef_db_init_mapped(struct ef_db *db, int is_new_file, uint64_t
             ef_db_bind_slots_layout(db);
             ef_db_mark_meta_dirty(db);
         }
+        if (db->sb->schema_version == EF_SCHEMA_VERSION_V4) {
+            err = ef_sb_migrate_v4_txn_layout(db->sb);
+            if (err != EF_OK) {
+                return err;
+            }
+            ef_db_mark_meta_dirty(db);
+            /* Zero the undo log segment. v4 file didn't have it; the
+             * mmap'd region after the slot area may contain random bytes
+             * that we must clear before the first transaction. */
+            {
+                uint64_t slots_end = db->slots_base +
+                                     (uint64_t)db->sb->max_slots * sizeof(struct ef_slot);
+                size_t undo_bytes = (size_t)EF_UNDO_HEADER_SIZE +
+                                    (size_t)db->undo_log_slots * EF_UNDO_RECORD_SIZE;
+                if (db->file_size >= slots_end + undo_bytes) {
+                    memset((uint8_t *)db->mmap_addr + slots_end, 0, undo_bytes);
+                }
+            }
+        }
+        /* v5: if a transaction was left active (stale), replay and clear. */
+        if (db->sb->schema_version >= EF_SCHEMA_VERSION) {
+            err = ef_txn_recover_from_stale_lock(db);
+            if (err != EF_OK) {
+                return err;
+            }
+        }
         err = ef_rebuild_free_list(db);
         if (err != EF_OK) {
             return err;
+        }
+        /* After migration, the file size should match the v5 layout
+         * (including the undo log segment). The caller may have provided a
+         * larger buffer for the memory backend; cap db->file_size at the
+         * true v5 layout to keep offset checks consistent. */
+        {
+            size_t v5_size = ef_expected_file_size(db->sb->max_slots,
+                                                   ef_hash_capacity_from_sb(db->sb),
+                                                   db->undo_log_slots);
+            if (db->file_size < v5_size) {
+                if (db->backend == EF_BACKEND_FILE) {
+                    /* The file should have been grown before init_mapped. */
+                    return EF_ERR_FILE_SIZE;
+                }
+                /* Memory backend: caller must have given us a buffer that
+                 * already covers the v5 size. The actual mmap is sized by
+                 * the port layer; bump db->file_size so offset checks pass
+                 * for offsets inside the undo log segment. */
+                db->file_size = v5_size;
+            }
         }
     }
 
@@ -798,7 +876,7 @@ enum ef_err ef_open_ex_hash(const char *filepath, uint64_t initial_slots, uint32
     }
 
     *db_out = NULL;
-    file_size = ef_expected_file_size(initial_slots, hash_capacity);
+    file_size = ef_expected_file_size(initial_slots, hash_capacity, EF_UNDO_LOG_DEFAULT_SLOTS);
 
     db = (struct ef_db *)calloc(1, sizeof(*db));
     if (db == NULL) {
@@ -812,6 +890,25 @@ enum ef_err ef_open_ex_hash(const char *filepath, uint64_t initial_slots, uint32
     }
 
     ef_db_bind_io(db, &io);
+    if (!is_new_file && db->sb != NULL &&
+        db->sb->schema_version < EF_SCHEMA_VERSION) {
+        /* Existing v3/v4 file: auto-grow the file to v5 layout before
+         * migration runs. The v3/v4 on-disk file is missing the undo log
+         * segment; without this grow the migration would write past the
+         * mapped size. */
+        size_t v5_size = ef_expected_file_size(db->sb->max_slots,
+                                               ef_hash_capacity_from_sb(db->sb),
+                                               EF_UNDO_LOG_DEFAULT_SLOTS);
+        if (db->file_size < v5_size) {
+            enum ef_err err_grow = ef_port_grow_file(&io, v5_size);
+            if (err_grow != EF_OK) {
+                ef_port_close(&io);
+                free(db);
+                return err_grow;
+            }
+            ef_db_bind_io(db, &io);
+        }
+    }
     err = ef_db_init_mapped(db, is_new_file, initial_slots, hash_capacity);
     if (err != EF_OK) {
         ef_port_close(&io);
@@ -947,14 +1044,20 @@ enum ef_err ef_open_memory_hash(void *buffer, size_t buffer_size, uint64_t max_s
     }
 
     *db_out = NULL;
-    need = ef_expected_file_size(max_slots, hash_capacity);
+    need = ef_expected_file_size(max_slots, hash_capacity, EF_UNDO_LOG_DEFAULT_SLOTS);
     if (!init_new) {
         const struct ef_superblock *sb_probe = (const struct ef_superblock *)buffer;
         size_t on_disk_need;
 
         if (ef_magic_valid(sb_probe) && sb_probe->slot_size == EF_SLOT_SIZE) {
+            /* Existing files: v5 already includes the undo log; older
+             * versions (v2/v3/v4) will be migrated by ef_db_init_mapped,
+             * so probe size matches the pre-migration layout. */
+            uint32_t probe_undo = (sb_probe->schema_version == EF_SCHEMA_VERSION)
+                                      ? EF_UNDO_LOG_DEFAULT_SLOTS
+                                      : 0U;
             on_disk_need = ef_expected_file_size(sb_probe->max_slots,
-                                                 ef_hash_capacity_from_sb(sb_probe));
+                                                 ef_hash_capacity_from_sb(sb_probe), probe_undo);
             if (on_disk_need > buffer_size) {
                 return EF_ERR_FILE_SIZE;
             }
@@ -1365,6 +1468,8 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
 {
     struct ef_slot *slot;
     enum ef_err err;
+    uint32_t prior_status;
+    uint32_t prior_crc;
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -1376,6 +1481,8 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
         ef_set_error(db, EF_ERR_SLOT_ID);
         return EF_ERR_SLOT_ID;
     }
+    prior_status = slot->status;
+    prior_crc = slot->header_crc;
 
     if (status == EF_STATUS_FREE) {
         if (slot->status == EF_STATUS_FREE) {
@@ -1393,12 +1500,18 @@ enum ef_err ef_set_status(struct ef_db *db, uint64_t slot_id, uint32_t status)
             ef_set_error(db, EF_OK);
             return EF_OK;
         }
+        if (ef_txn_active(db)) {
+            (void)ef_txn_record_slot_status(db, slot_id, prior_status, prior_crc);
+        }
         slot->status = EF_STATUS_USED;
         ef_slot_header_crc_store(db, slot_id, slot);
         ef_set_error(db, EF_OK);
         return EF_OK;
     }
 
+    if (ef_txn_active(db)) {
+        (void)ef_txn_record_slot_status(db, slot_id, prior_status, prior_crc);
+    }
     slot->status = status;
     if (ef_slot_status_has_crc(status)) {
         ef_slot_header_crc_store(db, slot_id, slot);
@@ -1414,6 +1527,7 @@ enum ef_err ef_set_next_offset(struct ef_db *db, uint64_t slot_id, uint64_t next
     struct ef_slot *slot;
     enum ef_err err;
     uint64_t ignored;
+    uint64_t prior_next;
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -1441,6 +1555,10 @@ enum ef_err ef_set_next_offset(struct ef_db *db, uint64_t slot_id, uint64_t next
         }
     }
 
+    prior_next = ef_slot_next_offset_load(slot);
+    if (ef_txn_active(db) && prior_next != next_offset) {
+        (void)ef_txn_record_slot_next(db, slot_id, prior_next);
+    }
     ef_slot_next_offset_store(slot, next_offset);
     ef_slot_header_crc_store(db, slot_id, slot);
     ef_set_error(db, EF_OK);
@@ -1453,6 +1571,9 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
     enum ef_err err;
     size_t cap;
     void *payload;
+    uint32_t prior_status;
+    uint32_t prior_crc;
+    uint8_t prior_payload_prefix[8];
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -1480,6 +1601,14 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
         return EF_ERR_SLOT_ID;
     }
 
+    prior_status = slot->status;
+    prior_crc = slot->header_crc;
+    if (prior_status != EF_STATUS_FREE && ef_slot_payload_ptr(db, slot) != NULL) {
+        memcpy(prior_payload_prefix, ef_slot_payload_ptr(db, slot), 8);
+    } else {
+        memset(prior_payload_prefix, 0, 8);
+    }
+
     if (slot->status == EF_STATUS_FREE) {
         err = ef_claim_slot(db, slot_id);
         if (err != EF_OK) {
@@ -1499,6 +1628,13 @@ enum ef_err ef_write_payload(struct ef_db *db, uint64_t slot_id, const void *dat
         return EF_ERR_NULL_ARG;
     }
 
+    if (ef_txn_active(db)) {
+        if (prior_status != EF_STATUS_FREE) {
+            (void)ef_txn_record_slot_payload(db, slot_id, prior_payload_prefix);
+        } else {
+            (void)ef_txn_record_slot_status(db, slot_id, prior_status, prior_crc);
+        }
+    }
     if (len > 0) {
         memcpy(payload, data, len);
     }
@@ -1516,6 +1652,7 @@ enum ef_err ef_write_field(struct ef_db *db, uint64_t slot_id, uint8_t field_off
     struct ef_slot *slot;
     uint8_t *field;
     enum ef_err err;
+    uint8_t prior_value;
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -1532,7 +1669,12 @@ enum ef_err ef_write_field(struct ef_db *db, uint64_t slot_id, uint8_t field_off
         ef_set_error(db, EF_ERR_OFFSET);
         return EF_ERR_OFFSET;
     }
-
+    prior_value = *field;
+    if (ef_txn_active(db) && field_offset == 0) {
+        /* Only field 0 (status low byte) is a meaningful 8-byte snapshot
+         * target; the rest of the slot write paths already record undo. */
+        (void)ef_txn_record_slot_payload(db, slot_id, &prior_value);
+    }
     *field = value;
     ef_slot_header_crc_store(db, slot_id, slot);
     ef_set_error(db, EF_OK);
@@ -1579,6 +1721,17 @@ enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, unsigned f
     }
 #if EF_HAS_HW_ATOMICS
     err = ef_free_list_pop_atomic(db, slot_id_out, clear_payload);
+    if (err == EF_OK && ef_txn_active(db)) {
+        struct ef_slot *slot = ef_peek_slot(db, *slot_id_out);
+        if (slot != NULL) {
+            uint32_t prior_status = EF_STATUS_FREE;
+            uint32_t prior_crc = slot->header_crc;
+            uint64_t prior_next = ef_slot_next_offset_load(slot);
+            (void)prior_next;
+            (void)ef_txn_record_slot_alloc(db, *slot_id_out, prior_status, prior_crc);
+            (void)ef_txn_record_free_count(db, -1);
+        }
+    }
     if (has_seqlock) {
         ef_sb_index_write_lock_release(db->sb);
     }
@@ -1587,6 +1740,8 @@ enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, unsigned f
     {
         struct ef_slot *slot;
         uint64_t slot_id;
+        uint32_t prior_status = EF_STATUS_FREE;
+        uint32_t prior_crc = 0;
 
         if (db->sb->free_list_head == 0 || ef_sb_free_count_load(db->sb) == 0) {
             ef_set_error(db, EF_ERR_SLOT_FULL);
@@ -1613,6 +1768,7 @@ enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, unsigned f
             return err;
         }
 
+        prior_crc = slot->header_crc;
         db->sb->free_list_head = slot->next_offset;
         slot->next_offset = 0;
         slot->status = EF_STATUS_USED;
@@ -1622,6 +1778,11 @@ enum ef_err ef_alloc_slot_ex(struct ef_db *db, uint64_t *slot_id_out, unsigned f
         ef_sb_free_count_dec(db->sb);
         ef_slot_header_crc_store(db, slot_id, slot);
         ef_db_mark_meta_dirty(db);
+
+        if (ef_txn_active(db)) {
+            (void)ef_txn_record_slot_alloc(db, slot_id, prior_status, prior_crc);
+            (void)ef_txn_record_free_count(db, -1);
+        }
 
         *slot_id_out = slot_id;
         ef_set_error(db, EF_OK);
@@ -1645,6 +1806,9 @@ enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id)
 {
     struct ef_slot *slot;
     enum ef_err err;
+    uint32_t prior_status;
+    uint32_t prior_crc;
+    uint64_t prior_next;
 
     err = ef_db_require_write(db);
     if (err != EF_OK) {
@@ -1655,6 +1819,9 @@ enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id)
     if (slot == NULL) {
         return ef_last_error(db);
     }
+    prior_status = slot->status;
+    prior_crc = slot->header_crc;
+    prior_next = ef_slot_next_offset_load(slot);
     if (slot->status == EF_STATUS_FREE) {
         ef_set_error(db, EF_ERR_SLOT_FREE);
         return EF_ERR_SLOT_FREE;
@@ -1684,6 +1851,10 @@ enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id)
         }
     }
 
+    if (ef_txn_active(db)) {
+        (void)ef_txn_record_slot_free(db, slot_id, prior_next, prior_status);
+        (void)ef_txn_record_free_count(db, 1);
+    }
     return ef_return_slot_to_pool(db, slot_id, slot);
 }
 

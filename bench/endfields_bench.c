@@ -443,7 +443,7 @@ static void bench_prepare_chain(struct ef_db *db, uint64_t chain_len)
 
 static void run_hash_perf_suite(volatile uintptr_t *sink)
 {
-    static alignas(64) uint8_t hash_arena[64 + 1024 * 16 + 512 * 64];
+    static alignas(64) uint8_t hash_arena[64 + 1024 * 16 + 512 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     double samples[BENCH_MAX_ROUNDS];
     double t0;
@@ -592,7 +592,7 @@ static void bench_ef_index_put_at_load(volatile uintptr_t *sink)
      * cost at four load-factor targets so the curve vs. collision rate is visible.
      * The prefill + bench together must stay below the 3/4 rehash threshold:
      * 3/4 * 4096 == 3072 entries. */
-    static alignas(64) uint8_t load_arena[64 + 4096 * 16 + 8192 * 64];
+    static alignas(64) uint8_t load_arena[64 + 4096 * 16 + 8192 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_id;
@@ -1004,7 +1004,7 @@ static void run_engineering_scenarios(void)
 
 static void run_memory_engineering(void)
 {
-    static alignas(64) uint8_t arena[64 + 256 * 64];
+    static alignas(64) uint8_t arena[64 + 256 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     double t0;
@@ -1068,6 +1068,92 @@ static void run_memory_engineering(void)
     }
 }
 
+static void run_txn_roundtrip_bench(void)
+{
+    static alignas(64) uint8_t arena[64 + 1024 * 16 + 4096 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
+    struct ef_db *db = NULL;
+    enum ef_err err;
+    double t0;
+    double t1;
+    int round;
+    const int n_ops = 1024;
+
+    printf("\n=== v5: txn roundtrip (1024 ops/round) ===\n");
+
+    err = ef_open_memory_hash(arena, sizeof(arena), 4096, 1024, 1, &db);
+    if (err != EF_OK || db == NULL) {
+        fprintf(stderr, "txn bench open failed: %s\n", ef_strerror(err));
+        return;
+    }
+
+    for (round = 0; round < 3; ++round) {
+        int i;
+        int commit_ok = 0;
+        int abort_ok = 0;
+
+        /* Commit half: write-then-commit. */
+        t0 = now_seconds();
+        for (i = 0; i < n_ops / 2; ++i) {
+            uint64_t sid = 0;
+            char key[16];
+            err = ef_txn_begin(db);
+            if (err != EF_OK) {
+                break;
+            }
+            err = ef_alloc_slot(db, &sid);
+            if (err != EF_OK) {
+                ef_txn_abort(db);
+                break;
+            }
+            snprintf(key, sizeof(key), "k-%d", i);
+            err = ef_index_put(db, key, sid);
+            if (err != EF_OK) {
+                ef_txn_abort(db);
+                break;
+            }
+            err = ef_txn_commit(db);
+            if (err != EF_OK) {
+                break;
+            }
+            ++commit_ok;
+        }
+        t1 = now_seconds();
+
+        /* Abort half: write-then-abort (should fully rollback). */
+        for (i = 0; i < n_ops / 2; ++i) {
+            uint64_t sid = 0;
+            char key[16];
+            err = ef_txn_begin(db);
+            if (err != EF_OK) {
+                break;
+            }
+            err = ef_alloc_slot(db, &sid);
+            if (err != EF_OK) {
+                ef_txn_abort(db);
+                break;
+            }
+            snprintf(key, sizeof(key), "abk-%d", i);
+            err = ef_index_put(db, key, sid);
+            if (err != EF_OK) {
+                ef_txn_abort(db);
+                break;
+            }
+            err = ef_txn_abort(db);
+            if (err != EF_OK) {
+                break;
+            }
+            ++abort_ok;
+        }
+
+        printf("  Round %d  commit=%d abort=%d  commit_time=%.3f ms  (%.1f us/op)\n",
+               round, commit_ok, abort_ok,
+               (t1 - t0) * 1000.0,
+               commit_ok > 0 ? (t1 - t0) / commit_ok * 1e6 : 0.0);
+    }
+
+    ef_close(db);
+}
+
 int main(void)
 {
     struct ef_db *db = NULL;
@@ -1087,6 +1173,9 @@ int main(void)
     run_perf_suite(db);
     ef_close(db);
     remove_test_file("bench.endf");
+
+    /* Transaction roundtrip benchmark (memory backend). */
+    run_txn_roundtrip_bench();
 #else
     (void)db;
     (void)err;

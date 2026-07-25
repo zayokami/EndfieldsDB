@@ -1,5 +1,6 @@
 #include "endfields.h"
 #include "ef_internal.h"
+#include "ef_txn.h"
 #include "ef_atomic_unaligned.h"
 
 #include <stddef.h>
@@ -169,6 +170,43 @@ enum ef_err ef_blob_release_chain(struct ef_db *db, uint64_t head_id, struct ef_
     return EF_OK;
 }
 
+/* When a transaction is active, ef_write_blob needs a different chain-release
+ * approach: normally ef_blob_release_chain returns each overflow slot to the
+ * pool (which removes them from the index); on abort, the SLOT_FREE undo
+ * records would put them back to USED state, but the index entries would
+ * already be gone. Instead, we walk the chain and clear next_offset so the
+ * individual SLOT_FREE / INDEX_REMOVE undo records handle the rollback. */
+static enum ef_err ef_blob_unlink_chain_in_txn(struct ef_db *db, uint64_t head_id,
+                                               struct ef_slot *head)
+{
+    uint64_t offset;
+
+    if (head == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    offset = head->next_offset;
+    head->next_offset = 0;
+    ef_slot_header_crc_store(db, head_id, head);
+    while (offset != 0) {
+        uint64_t slot_id;
+        struct ef_slot *slot;
+        uint64_t next;
+
+        if (ef_offset_to_slot_id(db, offset, &slot_id) != EF_OK) {
+            return EF_ERR_OFFSET;
+        }
+        slot = db->slots + slot_id;
+        if (slot->status != EF_STATUS_OVERFLOW) {
+            return EF_ERR_NOT_FOUND;
+        }
+        next = slot->next_offset;
+        slot->next_offset = 0;
+        ef_slot_header_crc_store(db, slot_id, slot);
+        offset = next;
+    }
+    return EF_OK;
+}
+
 enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, size_t len)
 {
     struct ef_slot *head;
@@ -221,13 +259,26 @@ enum ef_err ef_write_blob(struct ef_db *db, uint64_t slot_id, const void *data, 
         return EF_ERR_SLOT_BUSY;
     }
 
-    err = ef_blob_release_chain(db, slot_id, head);
+    if (ef_txn_active(db)) {
+        err = ef_blob_unlink_chain_in_txn(db, slot_id, head);
+    } else {
+        err = ef_blob_release_chain(db, slot_id, head);
+    }
     if (err != EF_OK) {
         return err;
     }
     head = ef_get_slot(db, slot_id);
     if (head == NULL) {
         return ef_last_error(db);
+    }
+
+    /* Record undo for the head slot's payload before we overwrite it. Saving
+     * the first 8 bytes captures the blob header (magic + length) which is
+     * sufficient for the rollback to restore the original blob header. */
+    if (ef_txn_active(db)) {
+        uint8_t prior_payload_prefix[8];
+        memcpy(prior_payload_prefix, ef_slot_payload_ptr(db, head), 8);
+        (void)ef_txn_record_slot_payload(db, slot_id, prior_payload_prefix);
     }
 
     total_len = (uint32_t)len;

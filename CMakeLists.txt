@@ -81,6 +81,8 @@ set(ENDFIELDS_LIB_SOURCES
     src/ef_queue.c
     src/ef_execute.c
     src/ef_grow.c
+    src/ef_undo.c
+    src/ef_txn.c
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86|x86")

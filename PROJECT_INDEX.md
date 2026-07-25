@@ -8,7 +8,7 @@
 
 Endfields DB 是一个 C11 实现的嵌入式数据库核心。核心设计是固定 64 字节槽位、mmap/内存后端、物理偏移寻址、持久化空闲链、FIFO 队列、Robin Hood 字符串哈希索引和 CRC 校验。
 
-当前源码版本使用 `EF_SCHEMA_VERSION 4`。v4 在 v3 的队列和哈希索引基础上，为索引增加写锁和 seqlock 读一致性保护。
+当前源码版本使用 `EF_SCHEMA_VERSION 5`。v5 在 v4 的基础上引入**事务/回滚机制**：独立 undo log 段、独立事务锁、显式 `ef_txn_begin/commit/abort` API、串行化隔离，禁止事务内 grow/rehash。
 
 ## 源码入口
 
@@ -17,9 +17,13 @@ Endfields DB 是一个 C11 实现的嵌入式数据库核心。核心设计是�
 | `src/endfields.h` | 公共 API、槽位/超级块/数据库句柄结构、错误码、命令格式 |
 | `src/endfields.c` | 核心实现: 打开/关闭、布局绑定、槽位访问、分配、扩容、blob、队列、CRC 提交、指令执行 |
 | `src/ef_index.h` | Robin Hood 哈希索引公共 API 和容量/装载因子常量 |
-| `src/ef_index.c` | 索引 put/get/remove/rehash/clear、v4 seqlock 读、写锁、槽区搬迁修正 |
-| `src/ef_sb_layout.h` | 超级块 `reserved[28]` 的 v3/v4 字段布局声明 |
-| `src/ef_sb_layout.c` | 超级块哈希容量、队列锁、索引写锁、index seq 和 v3->v4 布局迁移 |
+| `src/ef_index.c` | 索引 put/get/remove/rehash/clear、v4 seqlock 读、写锁、槽区搬迁修正、事务内禁 auto-rehash |
+| `src/ef_sb_layout.h` | 超级块 `reserved[28]` 的 v3/v4/v5 字段布局声明 |
+| `src/ef_sb_layout.c` | 超级块哈希容量、队列锁、索引写锁、txn_lock/txn_state、v3->v4 与 v4->v5 布局迁移 |
+| `src/ef_txn.h` | 事务公共 API（`ef_txn_begin/commit/abort/active`）与 helper 声明 |
+| `src/ef_txn.c` | 事务状态机、undo log 写入辅助（`ef_txn_record_*` 系列） |
+| `src/ef_undo.h` | undo log 段头、记录格式、`ef_undo_*` API |
+| `src/ef_undo.c` | undo log append / replay reverse / reset / header CRC |
 | `src/ef_port.h` | 文件/内存映射 I/O 抽象接口 |
 | `src/ef_port.c` | POSIX/Win32 文件映射、truncate/grow、sync、纯内存后端 |
 | `src/ef_crc.h` | CRC32 公共接口 |
@@ -27,11 +31,11 @@ Endfields DB 是一个 C11 实现的嵌入式数据库核心。核心设计是�
 | `src/ef_crc_internal.h` | CRC 内部接口，连接 portable 与 PCLMUL 实现 |
 | `src/ef_crc_pclmul.c` | x86/x64 PCLMULQDQ CRC32 快路径 |
 | `src/ef_atomic_unaligned.h` | 非自然对齐 mmap 字段上的 u8/u32/u64 原子 load/store/CAS helper |
-| `src/ef_config.h` | schema 版本、平台开关、prefetch、原子能力、branch hint |
-| `tests/test_core.c` | 核心、文件、内存、CRC、blob 测试入口 |
-| `tests/test_index_queue.c` | v3/v4 索引、队列、并发、迁移测试入口 |
-| `tests/test_common.h` / `tests/test_common.c` | 测试断言、文件 I/O helper、计时、清理工具 |
-| `bench/endfields_bench.c` | 性能与工程场景 bench |
+| `src/ef_config.h` | schema 版本（含 v5）、平台开关、prefetch、原子能力、branch hint、`EF_UNDO_LOG_*` |
+| `tests/test_core.c` | 核心、文件、内存、CRC、blob、事务测试入口 |
+| `tests/test_index_queue.c` | v3/v4/v5 索引、队列、并发、迁移测试入口 |
+| `tests/test_common.h` / `tests/test_common.c` | 测试断言、文件 I/O helper、计时、清理工具、事务 helper |
+| `bench/endfields_bench.c` | 性能与工程场景 bench（含 `bench_txn_roundtrip`） |
 | `src/main_embedded.c` | 纯 RAM/embedded-only 测试 |
 
 ## 构建与测试
@@ -203,8 +207,18 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 - `ef_sb_hash_capacity_load` / `ef_sb_hash_capacity_store`: 32-bit RMW 在 4 字节对齐 word 上更新 `hash_capacity`（v4 u16）并保留 `queue_lock` 与 `index_write_lock` u8，避免与 lock acquire CAS 循环产生 TSAN race。
 - `ef_sb_queue_lock_acquire` / `ef_sb_queue_lock_release`: 队列自旋锁。
 - `ef_sb_index_write_lock_acquire` / `ef_sb_index_write_lock_release`: 索引写自旋锁（v4）。
-- `ef_sb_index_write_seq_begin` / `ef_sb_index_write_seq_end` / `ef_sb_index_seq_load` / `ef_sb_index_seq_read_stable`: v4 seqlock 序列号。
+- `ef_sb_index_write_seq_begin` / `ef_sb_index_write_seq_end` / `ef_sb_index_seq_load` / `ef_sb_index_seq_read_stable`: v5 序号已搬迁到 undo log header（`ef_undo.h` 提供兼容包装）。
 - `ef_sb_migrate_v3_index_layout`: v3 → v4 reserved 布局迁移。
+- `ef_sb_migrate_v4_txn_layout`: v4 → v5 reserved 布局迁移（追加 undo log 段，写 `txn_lock=0` / `txn_state=NONE`）。
+
+### 事务与 Undo Log (v5)
+
+- `src/ef_txn.h` + `src/ef_txn.c`：事务 API、状态机、CAS 抢锁、stale 进程恢复、崩溃恢复。
+- `src/ef_undo.h` + `src/ef_undo.c`：undo log 段头（`struct ef_undo_header`，含搬迁过来的 seqlock）+ 32 字节记录格式（`struct ef_undo_record`）+ `ef_undo_record_append` / `ef_undo_replay_reverse` / `ef_undo_reset`。
+- 公开事务错误码：`EF_ERR_TXN_ACTIVE`、`EF_ERR_TXN_BUSY`、`EF_ERR_TXN_READONLY`、`EF_ERR_TXN_LOG_FULL`、`EF_ERR_TXN_BLOB`、`EF_ERR_TXN_CONFLICT`。
+- 文件布局 v5：`[ superblock ][ hash index ][ slots ][ undo log section ]`。
+- 事务期间：`ef_grow` 返回 `EF_ERR_GROW`；`ef_index_put` 触发 rehash 阈值返回 `EF_ERR_INDEX_BUSY`。
+- 跨进程 stale 事务检测：`txn_state == ACTIVE` 且 `txn_writer_pid/epoch` 与本进程不匹配 → 自动 replay 并清空 undo log。
 
 ### CRC 与持久化
 
@@ -224,9 +238,11 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 - `ef_queue_push` / `ef_queue_pop` 支持 MPMC，同进程多线程和跨进程 mmap 均按设计支持。
 - 空闲链在支持原子操作的平台上使用 CAS。
 - v4 索引读是多读者 seqlock；索引写通过 `index_write_lock` 串行化。
+- v5 事务通过 `txn_lock` 串行化（与 `index_write_lock`、`queue_lock` 解耦）；undo log 反向 replay 实现 abort。
 - 槽位 payload 读写、blob、指针追逐、迭代仍需调用方外部同步。
 - `ef_sync` / `ef_close` 需要调用方串行化。
 - `ef_index_rehash` 会搬迁槽区；调用方不得与槽位写并发执行。
+- 事务期间禁止隐式 `ef_grow` 与 auto-rehash（分别返回 `EF_ERR_GROW` / `EF_ERR_INDEX_BUSY`）。
 
 ## 测试索引
 
@@ -235,31 +251,26 @@ v4 `superblock.reserved[28]` 由 `src/ef_sb_layout.h` 定义:
 - `tests/test_core.c`: 基础 offset roundtrip、payload 写读、`ef_execute`、chase/chase_n。
 - 内存后端 reopen、slot iterator、blob、v1 upgrade、grow。
 - 文件后端 blob、reopen、bad magic、readonly、superblock/slot CRC。
-- `tests/test_index_queue.c`: v3/v4 队列和索引生命周期、rehash、v3->v4 index migration。
-- 当前工作区新增 `test_index_auto_rehash`。
-- `test_index_iterate`: iterate / iterate_until 回调三种返回值路径。
-- `test_index_shrink`: 手动收缩到目标容量，entry count 保留。
-- `test_index_mrsr`: 多读者 + 单写者索引并发。
-- `test_index_multi_writer`: 多写者 put/get/remove（4 writers × 800 keys）。
-- `test_index_multi_writer_rehash`: 多写者触发自动 rehash，验证 grow 期间写串行化与读无锁。
+- 事务测试（v5）：`test_txn_basic_commit`、`test_txn_basic_abort`、`test_txn_only_one_active`、`test_txn_payload_abort`、`test_txn_blob_rollback`、`test_txn_grow_forbidden`、`test_txn_persist_across_reopen`。
+- `tests/test_index_queue.c`: v3/v4/v5 队列和索引生命周期、rehash、迁移测试。
+- `test_index_auto_rehash` / `test_index_iterate_until` / `test_index_shrink` / `test_index_mrsr` / `test_index_multi_writer` / `test_index_multi_writer_rehash`。
+- 事务测试（v5）：`test_txn_queue_rollback`、`test_txn_rehash_forbidden`、`test_txn_concurrent_serialized`、`test_v4_to_v5_migration_open`。
 - `test_queue_mpmc`: 多生产者/多消费者队列。
-- `bench/endfields_bench.c`: 性能套件包含 chase、queue roundtrip、MPMC throughput、hash put/get/remove/rehash/auto rehash bench。
+- `bench/endfields_bench.c`: 性能套件包含 chase、queue roundtrip、MPMC throughput、hash put/get/remove/rehash/auto rehash、`bench_txn_roundtrip`。
 
 `src/main_embedded.c` 覆盖 embedded-only 内存打开、读写、grow、reopen。
 
 ## 当前开发重点
 
-索引 v4 增量（auto rehash / iterate / shrink / multi-writer / MRSW）已合入:
+Schema v5 事务/Undo Log 增量已合入:
 
-- `ef_index_put` 在插入后若超过 `3/4` 装载率，自动扩容到下一 2 的幂容量（≤ 65535）。
-- 更新已有 key 不触发扩容，也不增加 entry count。
-- `ef_index_rehash` 会搬迁槽区；插入前必须基于当前 `slots_base` 重新计算 slot offset。
-- 内存后端容量不足时返回 `EF_ERR_FILE_SIZE`，旧索引保持可用，新 key 不插入。
-- `ef_index_shrink` + `ef_index_pick_shrink_capacity` 提供手动收缩路径。
-- `ef_index_iterate` / `ef_index_iterate_until` 提供 entry 遍历与回调中止。
-- v4 reserved 布局下 `ef_index_get` 通过 seqlock 多读者无锁；`ef_index_put` / `remove` / `rehash` / `clear` 通过 index_write_lock 自旋锁串行化（多线程排队抢锁，互斥执行）。
-- v3 可写打开时自动迁移到 v4（hash_capacity ≤ 65535）；只读打开 v3 不修改 mmap，并发保护不生效。
-- `bench-out.txt`、`build*/`、根目录 `*.endf` 和 `*.exe` 是本地运行或构建产物，不应作为源码索引依据。
+- `EF_SCHEMA_VERSION = 5`；独立 undo log 段（默认 4096 slots ≈ 128 KiB）；`reserved[]` 重新分配增加 `txn_lock` / `txn_state`。
+- 公开事务 API：`ef_txn_begin` / `ef_txn_commit` / `ef_txn_abort` / `ef_txn_active`。
+- 串行化隔离：`txn_lock` CAS 抢锁，与 `index_write_lock` / `queue_lock` 共存无死锁。
+- 所有 mutating API（slot / index / queue / blob）事务 active 时写 undo 记录；abort 时由 `ef_undo_replay_reverse` 还原。
+- 事务期间禁止 `ef_grow`（`EF_ERR_GROW`）与 `ef_index_put` 触发 rehash（`EF_ERR_INDEX_BUSY`）。
+- v4 → v5 自动迁移：可写打开时由 `ef_sb_migrate_v4_txn_layout` 追加 undo log 段、刷新 superblock checksum。
+- 跨进程 stale 事务自动 recover：open 时检测 `txn_state == ACTIVE` 且 writer pid/epoch 不匹配 → 自动 replay 后释放锁。
 
 ## 接手建议
 

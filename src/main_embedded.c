@@ -25,7 +25,7 @@ static void expect_err(enum ef_err got, enum ef_err want, const char *msg)
 
 int main(void)
 {
-    static alignas(64) uint8_t arena[64 + 32 * 64];
+    static alignas(64) uint8_t arena[64 + 32 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     struct ef_slot *end;
     uint64_t id0 = 0;
@@ -96,7 +96,7 @@ int main(void)
     db = NULL;
 
     {
-        static uint8_t grow_arena[64 + 16 * 64];
+        static uint8_t grow_arena[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
         uint64_t seed_id = 0;
         uint64_t grown_id = 0;
 

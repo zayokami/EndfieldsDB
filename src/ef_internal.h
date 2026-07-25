@@ -49,11 +49,15 @@ struct ef_slot *ef_peek_slot(struct ef_db *db, uint64_t slot_id);
 /* Resolve a raw file offset to a slot pointer. Returns NULL on bad offset. */
 struct ef_slot *ef_slot_at_offset(struct ef_db *db, uint64_t offset, uint64_t *slot_id_out);
 
+/* Compute the raw file offset of a slot. */
+uint64_t ef_slot_to_offset(const struct ef_db *db, uint64_t slot_id);
+
 /* File layout helpers shared with ef_grow. */
-size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity);
+size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity, uint32_t undo_log_slots);
 void ef_db_to_io(const struct ef_db *db, struct ef_io *io);
 void ef_db_bind_io(struct ef_db *db, const struct ef_io *io);
 void ef_db_refresh_checksums(struct ef_db *db);
+void ef_sb_checksum_store(struct ef_superblock *sb);
 
 /* Superblock free_count primitives. */
 uint32_t ef_sb_free_count_load(const struct ef_superblock *sb);
@@ -80,5 +84,15 @@ enum ef_err ef_index_remove_by_slot(struct ef_db *db, uint64_t slot_id);
  * onto the persistent free list. Used by ef_blob chain freeing and by the
  * top-level ef_free_slot path. */
 enum ef_err ef_return_slot_to_pool(struct ef_db *db, uint64_t slot_id, struct ef_slot *slot);
+
+/* v5 transaction replay hooks. ef_queue_restore_before_push undoes a single
+ * push recorded in the undo log: the new node is unlinked and the tail
+ * pointer is restored. ef_queue_restore_before_pop reinserts a popped node
+ * into the FIFO chain. Both acquire the queue lock. */
+enum ef_err ef_queue_restore_before_push(struct ef_db *db, uint64_t new_node_offset,
+                                        uint64_t saved_tail_next);
+enum ef_err ef_queue_restore_before_pop(struct ef_db *db, uint64_t popped_node_offset,
+                                        uint64_t saved_dummy_next, uint64_t saved_tail,
+                                        uint64_t saved_node_next);
 
 #endif

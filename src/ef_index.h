@@ -26,6 +26,10 @@ _Static_assert(sizeof(struct ef_hash_entry) == 16, "ef_hash_entry must be 16 byt
 
 uint64_t ef_key_hash(const char *key, size_t key_len);
 
+/* Low-level entry insert (used by ef_index_put and the undo replay path). */
+enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint64_t slot_offset,
+                               int *added_out);
+
 enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id);
 enum ef_err ef_index_get(struct ef_db *db, const char *key, uint64_t *slot_id_out);
 /* Atomically resolve the key to a slot via the index and (optionally) copy the

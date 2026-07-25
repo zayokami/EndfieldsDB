@@ -11,7 +11,7 @@
 /* Forward decls for endfields.c-only helpers used by grow/upgrade. These are
  * exposed via the implementation file pattern: they're file-static in
  * endfields.c and called by name. We mirror the prototypes here. */
-size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity);
+size_t ef_expected_file_size(uint64_t max_slots, uint32_t hash_capacity, uint32_t undo_log_slots);
 void ef_db_to_io(const struct ef_db *db, struct ef_io *io);
 void ef_db_bind_io(struct ef_db *db, const struct ef_io *io);
 void ef_db_refresh_checksums(struct ef_db *db);
@@ -205,13 +205,22 @@ enum ef_err ef_grow(struct ef_db *db, uint64_t new_max_slots)
         return EF_ERR_NULL_ARG;
     }
 
+    /* Reject grow inside a transaction. Callers must pre-size the database
+     * (e.g. via ef_alloc_ex outside a transaction) before opening a
+     * transaction, so that slot relocation never overlaps with undo log
+     * recording. */
+    if (db->txn_active) {
+        ef_set_error(db, EF_ERR_GROW);
+        return EF_ERR_GROW;
+    }
+
     old_max = db->sb->max_slots;
     if (new_max_slots <= old_max) {
         ef_set_error(db, EF_ERR_GROW);
         return EF_ERR_GROW;
     }
 
-    new_size = ef_expected_file_size(new_max_slots, db->hash_capacity);
+    new_size = ef_expected_file_size(new_max_slots, db->hash_capacity, db->undo_log_slots);
     if (db->backend == EF_BACKEND_MEMORY && new_size > db->map_capacity) {
         ef_set_error(db, EF_ERR_FILE_SIZE);
         return EF_ERR_FILE_SIZE;
@@ -232,8 +241,8 @@ enum ef_err ef_grow(struct ef_db *db, uint64_t new_max_slots)
         db->file_size = new_size;
     }
 
-    memset((uint8_t *)db->mmap_addr + ef_expected_file_size(old_max, db->hash_capacity), 0,
-           new_size - ef_expected_file_size(old_max, db->hash_capacity));
+    memset((uint8_t *)db->mmap_addr + ef_expected_file_size(old_max, db->hash_capacity, db->undo_log_slots), 0,
+           new_size - ef_expected_file_size(old_max, db->hash_capacity, db->undo_log_slots));
 
     err = ef_grow_append_slots(db, old_max, new_max_slots);
     ef_set_error(db, err);

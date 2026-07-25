@@ -1,10 +1,24 @@
 #ifndef EF_CONFIG_H
 #define EF_CONFIG_H
 
-/* Schema v2: superblock + slot header CRC. v3: hash index + queue. v4: index seqlock MRSW. */
-#define EF_SCHEMA_VERSION 4U
+/* Schema v2: superblock + slot header CRC. v3: hash index + queue. v4: index seqlock MRSW.
+ * v5: persistent undo log + independent txn lock for read-write transactions. */
+#define EF_SCHEMA_VERSION 5U
+#define EF_SCHEMA_VERSION_V4 4U
 #define EF_SCHEMA_VERSION_V3 3U
 #define EF_SCHEMA_VERSION_V2 2U
+
+/* Default undo log record count for v5 transactions. Each record is 32B, so the
+ * default log size is 128 KiB. Configurable via ef_open_ex_hash_with / ef_open_memory_hash_with
+ * (undo_log_slots). The log lives in its own segment after the slot area and is
+ * independent of the slot CRC region. */
+#define EF_UNDO_LOG_DEFAULT_SLOTS 4096U
+
+/* v5 undo log segment size = header (32B) + records (32B * slots). Tests
+ * sizing arenas should add this constant to cover the persistent segment. */
+#define EF_UNDO_LOG_BYTES(slots) \
+    (32U + (uint64_t)(slots) * 32U)
+#define EF_UNDO_LOG_DEFAULT_BYTES EF_UNDO_LOG_BYTES(EF_UNDO_LOG_DEFAULT_SLOTS)
 
 /* Default Robin Hood table size for new databases (power-of-two friendly). */
 #define EF_DEFAULT_HASH_MIN 16U

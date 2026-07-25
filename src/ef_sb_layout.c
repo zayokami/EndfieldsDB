@@ -39,9 +39,26 @@ static volatile uint8_t *ef_sb_index_write_lock_byte(struct ef_superblock *sb)
     return (volatile uint8_t *)&sb->reserved[EF_SB_OFF_INDEX_WRITE_LOCK];
 }
 
+static volatile uint8_t *ef_sb_txn_lock_byte(struct ef_superblock *sb)
+{
+    return (volatile uint8_t *)&sb->reserved[EF_SB_OFF_TXN_LOCK];
+}
+
+static volatile uint8_t *ef_sb_txn_state_byte(struct ef_superblock *sb)
+{
+    return (volatile uint8_t *)&sb->reserved[EF_SB_OFF_TXN_STATE];
+}
+
+static const volatile uint8_t *ef_sb_txn_state_byte_ro(const struct ef_superblock *sb)
+{
+    return (const volatile uint8_t *)&sb->reserved[EF_SB_OFF_TXN_STATE];
+}
+
 static volatile uint32_t *ef_sb_index_seq_ptr(struct ef_superblock *sb)
 {
-    return (volatile uint32_t *)&sb->reserved[EF_SB_OFF_INDEX_SEQ];
+    (void)sb;
+    /* v5: the seqlock is in-memory; this helper is no longer used. */
+    return NULL;
 }
 
 static int ef_sb_uses_v4_index_layout(const struct ef_superblock *sb)
@@ -139,7 +156,32 @@ enum ef_err ef_sb_migrate_v3_index_layout(struct ef_superblock *sb)
     ef_sb_hash_capacity_store(sb, hash32);
     ef_atomic_store_u8(ef_sb_queue_lock_byte(sb), queue_lock8);
     ef_atomic_store_u8(ef_sb_index_write_lock_byte(sb), 0);
-    ef_atomic_store_u32(ef_sb_index_seq_ptr(sb), 0);
+    /* v3 -> v4: index_seq at [24..27] was set to 0 by the memset above. */
+    sb->schema_version = EF_SCHEMA_VERSION_V4;
+    return EF_OK;
+}
+
+enum ef_err ef_sb_migrate_v4_txn_layout(struct ef_superblock *sb)
+{
+    if (sb == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    if (sb->schema_version >= EF_SCHEMA_VERSION) {
+        return EF_OK;
+    }
+    if (sb->schema_version != EF_SCHEMA_VERSION_V4) {
+        return EF_OK;
+    }
+
+    /* v4 -> v5: relocate the v4 index_seq [24..27] into a 4-byte zero region;
+     * the actual seqlock now lives in db->index_seq (in-memory only). Zero out
+     * the txn_lock and txn_state fields, then advance the schema version. */
+    ef_atomic_store_u8(ef_sb_txn_lock_byte(sb), 0U);
+    ef_atomic_store_u8(ef_sb_txn_state_byte(sb), 0U);
+    /* Defensive: ensure [24..27] is fully zeroed (we just wrote 0/0 to 24/25
+     * and the 16-bit padding at [26..27] should remain 0 from v4 init). */
+    sb->reserved[26] = 0U;
+    sb->reserved[27] = 0U;
 
     sb->schema_version = EF_SCHEMA_VERSION;
     return EF_OK;
@@ -257,54 +299,111 @@ void ef_sb_index_write_lock_release(struct ef_superblock *sb)
     ef_atomic_store_u8(ef_sb_index_write_lock_byte(sb), 0U);
 }
 
-uint32_t ef_sb_index_seq_load(const struct ef_superblock *sb)
+uint32_t ef_sb_index_seq_load(const struct ef_db *db)
 {
-    if (sb == NULL || !ef_sb_uses_v4_index_layout(sb)) {
+    if (db == NULL || db->sb == NULL || !ef_sb_uses_v4_index_layout(db->sb)) {
         return 0;
     }
-
-    return ef_atomic_load_u32((const void *)&sb->reserved[EF_SB_OFF_INDEX_SEQ]);
+    return ef_atomic_load_u32((const void *)&db->index_seq);
 }
 
-void ef_sb_index_write_seq_begin(struct ef_superblock *sb)
+void ef_sb_index_write_seq_begin(struct ef_db *db)
 {
     volatile uint32_t *seq_ptr;
     uint32_t seq;
 
-    if (sb == NULL || !ef_sb_uses_v4_index_layout(sb)) {
+    if (db == NULL || db->sb == NULL || !ef_sb_uses_v4_index_layout(db->sb)) {
         return;
     }
 
-    seq_ptr = ef_sb_index_seq_ptr(sb);
+    seq_ptr = (volatile uint32_t *)&db->index_seq;
     seq = ef_atomic_load_u32((const void *)seq_ptr);
-    ef_atomic_store_u32(seq_ptr, seq + 1U);
+    ef_atomic_store_u32((void *)seq_ptr, seq + 1U);
     EF_ATOMIC_THREAD_FENCE();
 }
 
-void ef_sb_index_write_seq_end(struct ef_superblock *sb)
+void ef_sb_index_write_seq_end(struct ef_db *db)
 {
     volatile uint32_t *seq_ptr;
     uint32_t seq;
 
-    if (sb == NULL || !ef_sb_uses_v4_index_layout(sb)) {
+    if (db == NULL || db->sb == NULL || !ef_sb_uses_v4_index_layout(db->sb)) {
         return;
     }
 
-    seq_ptr = ef_sb_index_seq_ptr(sb);
+    seq_ptr = (volatile uint32_t *)&db->index_seq;
     EF_ATOMIC_THREAD_FENCE();
     seq = ef_atomic_load_u32((const void *)seq_ptr);
-    ef_atomic_store_u32(seq_ptr, seq + 1U);
+    ef_atomic_store_u32((void *)seq_ptr, seq + 1U);
 }
 
-int ef_sb_index_seq_read_stable(const struct ef_superblock *sb, uint32_t seq_before)
+int ef_sb_index_seq_read_stable(const struct ef_db *db, uint32_t seq_before)
 {
     uint32_t seq_after;
 
-    if (sb == NULL || !ef_sb_uses_v4_index_layout(sb)) {
+    if (db == NULL || db->sb == NULL || !ef_sb_uses_v4_index_layout(db->sb)) {
         return 1;
     }
 
     EF_ATOMIC_THREAD_FENCE();
-    seq_after = ef_sb_index_seq_load(sb);
+    seq_after = ef_sb_index_seq_load(db);
     return (seq_before == seq_after) && ((seq_after & 1U) == 0U);
+}
+
+enum ef_err ef_sb_txn_lock_try_acquire(struct ef_superblock *sb)
+{
+    volatile uint8_t *lock;
+    uint8_t exp = 0;
+    uint32_t spins = 0;
+
+    if (sb == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    if (sb->schema_version < EF_SCHEMA_VERSION) {
+        return EF_ERR_BAD_VERSION;
+    }
+
+    lock = ef_sb_txn_lock_byte(sb);
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+    for (;;) {
+        if (++spins > EF_SB_INDEX_SPIN_MAX) {
+            return EF_ERR_TXN_BUSY;
+        }
+        ef_sb_index_yield(spins);
+        exp = 0;
+        if (ef_atomic_cas_u8(lock, &exp, 1U)) {
+            return EF_OK;
+        }
+    }
+#else
+    if (ef_atomic_load_u8(lock) != 0U) {
+        return EF_ERR_TXN_BUSY;
+    }
+    ef_atomic_store_u8(lock, 1U);
+    return EF_OK;
+#endif
+}
+
+void ef_sb_txn_lock_release(struct ef_superblock *sb)
+{
+    if (sb == NULL || sb->schema_version < EF_SCHEMA_VERSION) {
+        return;
+    }
+    ef_atomic_store_u8(ef_sb_txn_lock_byte(sb), 0U);
+}
+
+uint8_t ef_sb_txn_state_load(const struct ef_superblock *sb)
+{
+    if (sb == NULL || sb->schema_version < EF_SCHEMA_VERSION) {
+        return 0;
+    }
+    return ef_atomic_load_u8((const void *)ef_sb_txn_state_byte_ro(sb));
+}
+
+void ef_sb_txn_state_store(struct ef_superblock *sb, uint8_t state)
+{
+    if (sb == NULL || sb->schema_version < EF_SCHEMA_VERSION) {
+        return;
+    }
+    ef_atomic_store_u8((void *)ef_sb_txn_state_byte(sb), state);
 }

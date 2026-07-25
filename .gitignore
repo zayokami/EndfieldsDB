@@ -28,7 +28,8 @@ compile_commands.json
 endfields_test
 endfields_embedded_test
 
-# Scratch / local-only
+# Bench / scratch
+bench-out.txt
 _gcc_test.c
 
 # IDE & editor

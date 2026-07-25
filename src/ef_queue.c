@@ -3,6 +3,7 @@
 #include "ef_port.h"
 #include "ef_atomic_unaligned.h"
 #include "ef_sb_layout.h"
+#include "ef_txn.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -108,6 +109,7 @@ static enum ef_err ef_queue_enqueue_mpmc(struct ef_db *db, uint64_t slot_offset,
     uint64_t dummy_offset = 0;
     uint64_t tail_off;
     uint64_t tail_id;
+    uint64_t saved_tail_next = 0;
     enum ef_err err;
 
     err = ef_queue_dummy_offset(db, &dummy_offset);
@@ -141,11 +143,15 @@ static enum ef_err ef_queue_enqueue_mpmc(struct ef_db *db, uint64_t slot_offset,
         return EF_ERR_OFFSET;
     }
 
+    saved_tail_next = ef_slot_next_offset_load(tail_slot);
     ef_slot_next_offset_store(tail_slot, slot_offset);
     ef_slot_header_crc_store(db, tail_id, tail_slot);
     EF_ATOMIC_STORE_U64(tail_ptr, slot_offset);
     ef_queue_lock_release(db);
     ef_db_mark_meta_dirty(db);
+    if (ef_txn_active(db)) {
+        (void)ef_txn_record_queue_push(db, slot_offset, saved_tail_next);
+    }
     ef_set_error(db, EF_OK);
     return EF_OK;
 }
@@ -214,6 +220,11 @@ static enum ef_err ef_queue_dequeue_mpmc(struct ef_db *db, void *buf, size_t buf
         memcpy(buf, payload + 1, stored_len);
     }
     *out_len = stored_len;
+
+    if (ef_txn_active(db)) {
+        uint64_t saved_dummy_next = ef_slot_next_offset_load(dummy);
+        (void)ef_txn_record_queue_pop(db, first_off, saved_dummy_next, tail_off, first_next);
+    }
 
     ef_slot_next_offset_store(dummy, first_next);
     if (tail_off == first_off) {
@@ -348,4 +359,117 @@ int ef_queue_drained(struct ef_db *db)
     drained = (ef_slot_next_offset_load(dummy) == 0);
     ef_queue_lock_release(db);
     return drained;
+}
+
+/* ===== Undo replay helpers =====
+ *
+ * These functions are called by ef_undo_replay_reverse to restore the FIFO
+ * queue's head/tail/list pointers to a state captured before a push or pop.
+ * They are no-ops outside a replay context (the caller already holds the
+ * transaction lock and the queue lock is acquired here).
+ */
+
+enum ef_err ef_queue_restore_before_push(struct ef_db *db, uint64_t new_node_offset,
+                                          uint64_t saved_tail_next)
+{
+    volatile uint64_t *tail_ptr;
+    volatile uint64_t *head_ptr;
+    struct ef_slot *node;
+    struct ef_slot *old_tail;
+    uint64_t old_tail_offset;
+    uint64_t node_id;
+    uint64_t old_tail_id;
+    enum ef_err err;
+
+    if (db == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    err = ef_queue_lock_acquire(db);
+    if (err != EF_OK) {
+        return err;
+    }
+    tail_ptr = (volatile uint64_t *)ef_sb_queue_tail_ptr(db->sb);
+    head_ptr = (volatile uint64_t *)ef_sb_queue_head_ptr(db->sb);
+    (void)head_ptr;
+
+    old_tail_offset = EF_ATOMIC_LOAD_U64(tail_ptr);
+    if (old_tail_offset != new_node_offset) {
+        /* Already undone by a later operation. */
+        ef_queue_lock_release(db);
+        return EF_OK;
+    }
+    node = ef_slot_at_offset(db, new_node_offset, &node_id);
+    if (node == NULL) {
+        ef_queue_lock_release(db);
+        return EF_ERR_OFFSET;
+    }
+    /* Find the prior tail: the slot that should regain saved_tail_next as its
+     * next. We walk from the head forward; in practice the head is the
+     * previous tail for a single-push restore. */
+    old_tail = ef_slot_at_offset(db, saved_tail_next, &old_tail_id);
+    if (old_tail == NULL) {
+        /* Saved tail was the dummy itself. The dummy's next_offset was
+         * pointing at the new node; restore it to 0. */
+        uint64_t dummy_offset = EF_ATOMIC_LOAD_U64(head_ptr);
+        struct ef_slot *dummy = ef_slot_at_offset(db, dummy_offset, NULL);
+        if (dummy != NULL) {
+            ef_slot_next_offset_store(dummy, 0);
+            ef_slot_header_crc_store(db, dummy_offset, dummy);
+        }
+    } else {
+        ef_slot_next_offset_store(old_tail, 0);
+        ef_slot_header_crc_store(db, old_tail_id, old_tail);
+    }
+    EF_ATOMIC_STORE_U64(tail_ptr, saved_tail_next);
+    node->status = EF_STATUS_USED;
+    ef_slot_header_crc_store(db, node_id, node);
+    ef_queue_lock_release(db);
+    ef_db_mark_meta_dirty(db);
+    return EF_OK;
+}
+
+enum ef_err ef_queue_restore_before_pop(struct ef_db *db, uint64_t popped_node_offset,
+                                         uint64_t saved_dummy_next, uint64_t saved_tail,
+                                         uint64_t saved_node_next)
+{
+    volatile uint64_t *tail_ptr;
+    volatile uint64_t *head_ptr;
+    struct ef_slot *node;
+    struct ef_slot *dummy;
+    uint64_t dummy_offset;
+    uint64_t node_id;
+    uint64_t dummy_id;
+    enum ef_err err;
+
+    if (db == NULL) {
+        return EF_ERR_NULL_ARG;
+    }
+    err = ef_queue_lock_acquire(db);
+    if (err != EF_OK) {
+        return err;
+    }
+    head_ptr = (volatile uint64_t *)ef_sb_queue_head_ptr(db->sb);
+    tail_ptr = (volatile uint64_t *)ef_sb_queue_tail_ptr(db->sb);
+    dummy_offset = EF_ATOMIC_LOAD_U64(head_ptr);
+    dummy = ef_slot_at_offset(db, dummy_offset, &dummy_id);
+    if (dummy == NULL) {
+        ef_queue_lock_release(db);
+        return EF_ERR_OFFSET;
+    }
+    node = ef_slot_at_offset(db, popped_node_offset, &node_id);
+    if (node == NULL) {
+        ef_queue_lock_release(db);
+        return EF_ERR_OFFSET;
+    }
+    /* Re-link the popped node back into the chain after the dummy. */
+    ef_slot_next_offset_store(dummy, popped_node_offset);
+    ef_slot_header_crc_store(db, dummy_id, dummy);
+    ef_slot_next_offset_store(node, saved_node_next);
+    node->status = EF_STATUS_QUEUED;
+    ef_slot_header_crc_store(db, node_id, node);
+    EF_ATOMIC_STORE_U64(tail_ptr, saved_tail);
+    ef_queue_lock_release(db);
+    ef_db_mark_meta_dirty(db);
+    (void)saved_dummy_next;
+    return EF_OK;
 }

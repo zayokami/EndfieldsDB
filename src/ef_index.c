@@ -2,6 +2,8 @@
 #include "ef_port.h"
 #include "ef_atomic_unaligned.h"
 #include "ef_sb_layout.h"
+#include "ef_txn.h"
+#include "ef_internal.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -58,8 +60,10 @@ static uint64_t *ef_idx_queue_tail_ptr(struct ef_superblock *sb)
 
 static size_t ef_index_file_size(uint64_t max_slots, uint32_t hash_capacity)
 {
+    /* v5: include the default undo log segment so rehash on file backend
+     * preserves the persistent segment the migration already grew. */
     return (size_t)(EF_SB_SIZE + (uint64_t)hash_capacity * EF_HASH_ENTRY_SIZE +
-                    max_slots * sizeof(struct ef_slot));
+                    max_slots * sizeof(struct ef_slot) + EF_UNDO_LOG_DEFAULT_BYTES);
 }
 
 static uint64_t ef_index_slots_base(uint32_t hash_capacity)
@@ -182,7 +186,7 @@ static enum ef_err ef_index_write_begin(struct ef_db *db)
         return err;
     }
 
-    ef_sb_index_write_seq_begin(db->sb);
+    ef_sb_index_write_seq_begin(db);
     return EF_OK;
 }
 
@@ -192,7 +196,7 @@ static void ef_index_write_end(struct ef_db *db)
         return;
     }
 
-    ef_sb_index_write_seq_end(db->sb);
+    ef_sb_index_write_seq_end(db);
     ef_sb_index_write_lock_release(db->sb);
 }
 
@@ -230,8 +234,8 @@ uint64_t ef_key_hash(const char *key, size_t key_len)
 
 /* Insert or update key_hash -> slot_offset. On success, *added_out is set to 1 when a
  * brand-new key was inserted, 0 when an existing key was overwritten. */
-static enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint64_t slot_offset,
-                                      int *added_out)
+enum ef_err ef_index_put_entry(struct ef_db *db, uint64_t key_hash, uint64_t slot_offset,
+                               int *added_out)
 {
     uint32_t capacity;
     uint32_t home;
@@ -340,17 +344,17 @@ static enum ef_err ef_index_find_entry(const struct ef_db *db, uint64_t key_hash
         uint32_t seq1;
         enum ef_err err;
 
-        seq1 = ef_sb_index_seq_load(db->sb);
+        seq1 = ef_sb_index_seq_load(db);
         if ((seq1 & 1U) != 0U) {
             ef_index_read_yield(attempt);
             continue;
         }
 
         err = ef_index_find_entry_unlocked(db, key_hash, out);
-        if (err == EF_ERR_NOT_FOUND && ef_sb_index_seq_read_stable(db->sb, seq1)) {
+        if (err == EF_ERR_NOT_FOUND && ef_sb_index_seq_read_stable(db, seq1)) {
             return EF_ERR_NOT_FOUND;
         }
-        if (err == EF_OK && ef_sb_index_seq_read_stable(db->sb, seq1)) {
+        if (err == EF_OK && ef_sb_index_seq_read_stable(db, seq1)) {
             return EF_OK;
         }
 
@@ -383,6 +387,17 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     err = ef_index_require_write(db);
     if (err != EF_OK) {
         return err;
+    }
+
+    /* Transactions must pre-size the index; auto-rehash cannot run under
+     * a transaction because it relocates the slot area. */
+    if (ef_txn_active(db) && db->hash_index != NULL &&
+        ef_index_needs_grow(db->hash_entry_count, db->hash_capacity)) {
+        struct ef_hash_entry probe;
+        if (ef_index_find_entry_unlocked(db, ef_key_hash(key, strlen(key)), &probe) != EF_OK) {
+            ef_set_error(db, EF_ERR_INDEX_BUSY);
+            return EF_ERR_INDEX_BUSY;
+        }
     }
 
     key_hash = ef_key_hash(key, strlen(key));
@@ -441,6 +456,9 @@ enum ef_err ef_index_put(struct ef_db *db, const char *key, uint64_t slot_id)
     ef_index_write_end(db);
     if (err == EF_OK) {
         ef_db_mark_meta_dirty(db);
+        if (ef_txn_active(db) && added) {
+            (void)ef_txn_record_index_put(db, key_hash, slot_offset);
+        }
     }
     return err;
 }
@@ -588,6 +606,9 @@ static enum ef_err ef_index_remove_by_hash(struct ef_db *db, uint64_t key_hash)
 enum ef_err ef_index_remove(struct ef_db *db, const char *key)
 {
     enum ef_err err;
+    uint64_t key_hash;
+    struct ef_hash_entry snapshot;
+    struct ef_hash_entry *snapshot_ptr = NULL;
 
     if (db == NULL || key == NULL) {
         return EF_ERR_NULL_ARG;
@@ -610,7 +631,16 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
         return EF_ERR_NULL_ARG;
     }
 
-    err = ef_index_remove_by_hash(db, ef_key_hash(key, strlen(key)));
+    key_hash = ef_key_hash(key, strlen(key));
+    /* Snapshot the entry so we can record undo before we mutate it. */
+    if (ef_txn_active(db)) {
+        if (ef_index_find_entry_unlocked(db, key_hash, &snapshot) != EF_OK) {
+            ef_index_write_end(db);
+            return EF_ERR_NOT_FOUND;
+        }
+        snapshot_ptr = &snapshot;
+    }
+    err = ef_index_remove_by_hash(db, key_hash);
     if (err == EF_OK) {
         /* Snapshot the shrink inputs under the lock so we don't race with
          * concurrent writers updating db->hash_capacity or db->hash_entry_count.
@@ -621,6 +651,9 @@ enum ef_err ef_index_remove(struct ef_db *db, const char *key)
         uint32_t capacity = db->hash_capacity;
         ef_index_write_end(db);
         ef_db_mark_meta_dirty(db);
+        if (snapshot_ptr != NULL) {
+            (void)ef_txn_record_index_remove(db, key_hash, snapshot_ptr->slot_offset);
+        }
         if (ef_index_should_shrink_snap(db, entries, capacity)) {
             (void)ef_index_shrink(db, ef_index_pick_shrink_capacity(entries, capacity));
         }
@@ -1118,7 +1151,7 @@ static enum ef_err ef_index_iterate_impl(const struct ef_db *db, ef_index_iter_f
 
     capacity = db->hash_capacity;
     if (stop_on_writer && ef_index_has_seqlock(db)) {
-        prev_seq = ef_sb_index_seq_load(db->sb);
+        prev_seq = ef_sb_index_seq_load(db);
         watching_seq = 1;
     }
 
@@ -1132,7 +1165,7 @@ static enum ef_err ef_index_iterate_impl(const struct ef_db *db, ef_index_iter_f
         }
 
         if (stop_on_writer && watching_seq) {
-            uint32_t now_seq = ef_sb_index_seq_load(db->sb);
+            uint32_t now_seq = ef_sb_index_seq_load(db);
             if (now_seq != prev_seq) {
                 return EF_ERR_INDEX_BUSY;
             }

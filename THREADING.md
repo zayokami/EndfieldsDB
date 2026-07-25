@@ -136,6 +136,70 @@ for (;;) {
 
 CI 矩阵对每种组合运行 Linux GCC Release / Debug / no-prefetch / ASan+UBSan / TSan、Linux Clang Release、macOS Clang Release、Windows MSVC Release、Windows MinGW Release+Debug、Linux embedded-only、Linux clang-tidy+cppcheck 静态分析；所有 job 启用 `-Werror`（`ENDFIELDS_WARNINGS_AS_ERRORS=ON`）。
 
+## Schema v5：事务 / Undo Log
+
+### 新增字段（超级块 `reserved[]` 重排）
+
+| 偏移 | 字段 | 用途 |
+|------|------|------|
+| `[0..3]` | `sb_checksum`（不变） | 超级块 CRC32 |
+| `[4..11]` | `queue_head` u64（不变） | 队列头指针 |
+| `[12..19]` | `queue_tail` u64（不变） | 队列尾指针 |
+| `[20..21]` | `hash_capacity` u16（不变） | Robin Hood 容量 |
+| `[22]` | `queue_lock` u8（不变） | 队列自旋锁 |
+| `[23]` | `index_write_lock` u8（不变） | 索引写自旋锁 |
+| `[24]` | `txn_lock` u8（新增） | 事务自旋锁（与 `index_write_lock` / `queue_lock` 错位以避免原子读冲突） |
+| `[25]` | `txn_state` u8（新增） | 0=NONE / 1=ACTIVE / 2=ABORTING |
+| `[26..27]` | `padding` | 保留 |
+| 已删除 | `index_seq` u32（v4） | 搬迁到 undo log header 区域内（`ef_undo.h`） |
+
+### 文件布局 (v5)
+
+```
+[ superblock 64B ][ hash index capacity * 16B ][ slots max_slots * 64B ][ undo log section ]
+```
+
+- undo log 段：`EF_UNDO_LOG_HEADER_BYTES + slots * sizeof(struct ef_undo_record)`，默认 4096 slots ≈ 128 KiB。
+- undo log 段在槽区之后追加，迁移 v4 文件时按需追加（不破坏现有数据）。
+- undo log 段独立 mmap 区，自有 header CRC32。
+
+### 公开事务 API
+
+| API | 行为 |
+|-----|------|
+| `ef_txn_begin(db)` | CAS 抢 `txn_lock`；失败返回 `EF_ERR_TXN_BUSY`（调用方重试或回退到只读） |
+| `ef_txn_commit(db)` | 清空 undo log / 释放锁 / 状态 NONE |
+| `ef_txn_abort(db)` | 反向 replay undo log → 清空 → 释放锁 → NONE |
+| `ef_txn_active(db)` | 查询（无副作用） |
+
+### 写路径自动 undo 记录
+
+事务 active 时以下 mutating API 自动写 undo 记录：
+
+- `ef_set_status` / `ef_write_payload` / `ef_set_next_offset` / `ef_write_field`
+- `ef_alloc_slot` / `ef_free_slot`
+- `ef_index_put` / `ef_index_remove` / `ef_index_remove_by_slot` / `ef_index_clear`
+- `ef_queue_push` / `ef_queue_pop`（区分 push：节点+链接；pop：节点+链接还原）
+- `ef_write_blob`（链槽创建、payload 前镜像）
+
+### 事务限制
+
+| 场景 | 行为 |
+|------|------|
+| `ef_alloc_slot` 槽满 → `ef_grow` | 事务内禁止隐式 grow，返回 `EF_ERR_GROW` |
+| `ef_index_put` 触发 auto-rehash | 事务内禁止 rehash，返回 `EF_ERR_INDEX_BUSY` |
+| undo log 段满 | 返回 `EF_ERR_TXN_LOG_FULL`；调用方 commit 后开新事务 |
+| 同一进程重复 `ef_txn_begin` | 第二个返回 `EF_ERR_TXN_BUSY`（应等待第一个事务结束） |
+
+### 崩溃恢复
+
+- `txn_state == ACTIVE` 且 `txn_writer_pid/epoch` 与当前进程不匹配 → 视为 stale，自动 replay 后清空 undo log 释放锁。
+- 正常打开路径不变。
+
+### 测试覆盖
+
+`test_txn_*`、`test_v4_to_v5_migration_open`：见 `tests/test_core.c` 与 `tests/test_index_queue.c`。
+
 ## 后续计划（未实现）
 
 - 槽位读侧与索引读的原子组合 API：仍由调用方负责在 index read 返回 `slot_id` 后到访问槽位 payload 期间不发生写者修改该槽，或使用外部互斥。

@@ -4,7 +4,7 @@ static void test_null_args_open(void)
 {
     struct ef_db *db = NULL;
     enum ef_err err;
-    static alignas(64) uint8_t buf[64 + 64 * 64];
+    static alignas(64) uint8_t buf[64 + 64 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
 
     err = ef_open_ex(NULL, 64, &db);
     expect_err(err, EF_ERR_NULL_ARG, "ef_open_ex NULL filepath");
@@ -23,7 +23,7 @@ static void test_null_args_open(void)
 
 static void test_null_args_with_db(void)
 {
-    static alignas(64) uint8_t buf[64 + 64 * 64];
+    static alignas(64) uint8_t buf[64 + 64 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     struct ef_cmd cmd;
     enum ef_err err;
@@ -144,7 +144,7 @@ static void test_readonly_write_attempts(void)
 
 static void test_corrupted_superblock(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_superblock *sb;
     struct ef_db *db = NULL;
     enum ef_err err;
@@ -181,7 +181,7 @@ static void test_corrupted_superblock(void)
 
 static void test_invalid_slot_ids_and_offsets(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t slot_id = 0;
     enum ef_err err;
@@ -216,7 +216,7 @@ static void test_invalid_slot_ids_and_offsets(void)
 
 static void test_payload_length_errors(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint8_t data[EF_PAYLOAD_SIZE + 1];
     uint64_t slot_id = 0;
@@ -238,7 +238,7 @@ static void test_payload_length_errors(void)
 
 static void test_queue_empty_pop(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint8_t out[64];
     size_t out_len = 0;
@@ -259,7 +259,7 @@ static void test_queue_empty_pop(void)
 
 static void test_index_without_hash(void)
 {
-    static alignas(64) uint8_t buf[64 + 16 * 64];
+    static alignas(64) uint8_t buf[64 + 16 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t looked = 0;
     enum ef_err err;
@@ -286,7 +286,7 @@ static void test_index_without_hash(void)
 
 static void test_chase_depth(void)
 {
-    static alignas(64) uint8_t buf[64 + (EF_CHASE_MAX_DEPTH + 2) * 64];
+    static alignas(64) uint8_t buf[64 + (EF_CHASE_MAX_DEPTH + 2) * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     uint64_t slots[EF_CHASE_MAX_DEPTH + 2];
     uint64_t i;
@@ -328,7 +328,7 @@ static void test_chase_depth(void)
 
 static void test_chase_cycle(void)
 {
-    static alignas(64) uint8_t buf[64 + 4 * 64];
+    static alignas(64) uint8_t buf[64 + 4 * 64 + EF_UNDO_LOG_DEFAULT_BYTES];
     struct ef_db *db = NULL;
     enum ef_err err;
     uint64_t slot_a = 0;

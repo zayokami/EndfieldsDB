@@ -7,6 +7,7 @@
 
 #include "endfields.h"
 #include "ef_config.h"
+#include "ef_internal.h"
 #include "ef_index.h"
 #include "ef_sb_layout.h"
 #include "ef_crc.h"
@@ -33,5 +34,10 @@ int main_io_write(FILE *fp, const void *buf, size_t nbytes);
 double now_seconds(void);
 void remove_test_file(const char *path);
 int test_finish(const char *label);
+
+/* Transaction test helpers. */
+void begin_txn_or_fail(struct ef_db *db, const char *msg);
+void abort_txn_or_fail(struct ef_db *db, const char *msg);
+void commit_txn_or_fail(struct ef_db *db, const char *msg);
 
 #endif
