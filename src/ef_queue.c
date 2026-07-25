@@ -15,7 +15,6 @@
 #define EF_ATOMIC_STORE_U64(p, v) ef_atomic_store_u64((volatile void *)(p), (v))
 #define EF_ATOMIC_CAS_U64(p, expected, desired) \
     ef_atomic_cas_u64((volatile void *)(p), (expected), (desired))
-#define EF_ATOMIC_THREAD_FENCE() ef_atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 #define EF_QUEUE_SPIN_MAX 65536U
 
