@@ -258,6 +258,8 @@ endfields-db/
 ├── THREADING.md                    # 并发与跨进程语义
 ├── PROJECT_INDEX.md                # 代码库接手索引
 ├── CLAUDE.md                       # 给 AI 助手的项目导览
+├── docs/
+│   └── API_GUIDE.md                 # 全量 API 索引 + 调用示例（英文）
 ├── src/
 │   ├── endfields.h / .c            # 公共 API 与核心实现
 │   ├── ef_index.h / .c             # Robin Hood 索引（v4 seqlock + 自动 rehash + shrink）
@@ -284,7 +286,7 @@ endfields-db/
 
 ## 接手顺序建议
 
-1. **想用 API**：本 README 的「30 秒上手」+ 头文件 [`src/endfields.h`](src/endfields.h)。
+1. **想用 API**：[`docs/API_GUIDE.md`](docs/API_GUIDE.md) 给出每一个公开函数的参数、返回值、错误码与端到端示例；头文件 `[src/endfields.h](src/endfields.h)`、`[src/ef_index.h](src/ef_index.h)`、`[src/ef_txn.h](src/ef_txn.h)` 仍是事实来源。
 2. **关心并发**：[`THREADING.md`](THREADING.md)。
 3. **想理解代码组织**：[`PROJECT_INDEX.md`](PROJECT_INDEX.md)。
 4. **修改 `superblock.reserved[]` 布局**：永远只动 [`src/ef_sb_layout.h`](src/ef_sb_layout.h) / `.c`，并在三种迁移路径（v3→v4、v4→v5、嵌入式初始化）里都加测试。

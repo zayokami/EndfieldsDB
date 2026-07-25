@@ -310,6 +310,8 @@ endfields-db/
 ├── THREADING.md                    # concurrency / cross-process semantics
 ├── PROJECT_INDEX.md                # codebase handover index
 ├── CLAUDE.md                       # project guide for AI assistants
+├── docs/
+│   └── API_GUIDE.md                 # full per-function API reference + recipes
 ├── src/
 │   ├── endfields.h / .c            # public API and core implementation
 │   ├── ef_index.h / .c             # Robin Hood index (v4 seqlock + auto-rehash + shrink)
@@ -336,10 +338,12 @@ endfields-db/
 
 ## Where to go next
 
-1. **Just want to use the API**: the **30-second quickstart** above, plus
-   the headers [`src/endfields.h`](src/endfields.h),
-   [`src/ef_index.h`](src/ef_index.h),
-   [`src/ef_txn.h`](src/ef_txn.h).
+1. **Just want to use the API**: read the **30-second quickstart** above,
+   then the full per-function reference in
+   [`docs/API_GUIDE.md`](docs/API_GUIDE.md) for every public call,
+   error code, and end-to-end recipe. The headers
+   [`src/endfields.h`](src/endfields.h), [`src/ef_index.h`](src/ef_index.h),
+   [`src/ef_txn.h`](src/ef_txn.h) remain the source of truth.
 2. **Care about concurrency**: [`THREADING.md`](THREADING.md).
 3. **Want to understand the code organisation**: [`PROJECT_INDEX.md`](PROJECT_INDEX.md).
 4. **Need to modify `superblock.reserved[]`**: only touch
