@@ -54,13 +54,6 @@ static const volatile uint8_t *ef_sb_txn_state_byte_ro(const struct ef_superbloc
     return (const volatile uint8_t *)&sb->reserved[EF_SB_OFF_TXN_STATE];
 }
 
-static volatile uint32_t *ef_sb_index_seq_ptr(struct ef_superblock *sb)
-{
-    (void)sb;
-    /* v5: the seqlock is in-memory; this helper is no longer used. */
-    return NULL;
-}
-
 static int ef_sb_uses_v4_index_layout(const struct ef_superblock *sb)
 {
     return sb != NULL && sb->schema_version >= EF_SCHEMA_VERSION;

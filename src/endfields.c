@@ -1807,7 +1807,6 @@ enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id)
     struct ef_slot *slot;
     enum ef_err err;
     uint32_t prior_status;
-    uint32_t prior_crc;
     uint64_t prior_next;
 
     err = ef_db_require_write(db);
@@ -1820,7 +1819,6 @@ enum ef_err ef_free_slot(struct ef_db *db, uint64_t slot_id)
         return ef_last_error(db);
     }
     prior_status = slot->status;
-    prior_crc = slot->header_crc;
     prior_next = ef_slot_next_offset_load(slot);
     if (slot->status == EF_STATUS_FREE) {
         ef_set_error(db, EF_ERR_SLOT_FREE);
