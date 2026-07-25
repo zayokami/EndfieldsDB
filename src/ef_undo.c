@@ -93,7 +93,7 @@ enum ef_err ef_undo_record_append(struct ef_db *db, uint8_t kind, uint64_t targe
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    if (!db->txn_active) {
+    if (!ef_txn_active(db)) {
         /* Appends are only valid during a transaction. Outside a transaction
          * we silently drop the record; the actual mutation must already be
          * durable. */

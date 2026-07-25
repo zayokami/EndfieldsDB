@@ -21,7 +21,7 @@ int ef_txn_active(const struct ef_db *db)
     if (db == NULL) {
         return 0;
     }
-    return db->txn_active != 0;
+    return ef_atomic_load_u8(&db->txn_active) != 0U;
 }
 
 /* ===== Begin / Commit / Abort ===== */
@@ -40,7 +40,7 @@ enum ef_err ef_txn_begin(struct ef_db *db)
         ef_set_error(db, EF_ERR_BAD_VERSION);
         return EF_ERR_BAD_VERSION;
     }
-    if (db->txn_active) {
+    if (ef_atomic_load_u8(&db->txn_active) != 0U) {
         ef_set_error(db, EF_ERR_TXN_BUSY);
         return EF_ERR_TXN_BUSY;
     }
@@ -52,9 +52,9 @@ enum ef_err ef_txn_begin(struct ef_db *db)
     /* Set state to ACTIVE before resetting the log so that ef_undo_record
      * accepts appends. */
     ef_sb_txn_state_store(db->sb, EF_TXN_STATE_ACTIVE);
-    db->txn_state = EF_TXN_STATE_ACTIVE;
-    db->txn_active = 1;
-    db->txn_writer_pid = ef_txn_get_pid();
+    ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_ACTIVE);
+    ef_atomic_store_u8(&db->txn_active, 1U);
+    ef_atomic_store_u32(&db->txn_writer_pid, ef_txn_get_pid());
     ef_undo_reset(db);
     ef_db_mark_meta_dirty(db);
     ef_set_error(db, EF_OK);
@@ -66,14 +66,14 @@ enum ef_err ef_txn_commit(struct ef_db *db)
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    if (!db->txn_active) {
+    if (ef_atomic_load_u8(&db->txn_active) == 0U) {
         /* No-op: committing outside a transaction is allowed. */
         ef_set_error(db, EF_OK);
         return EF_OK;
     }
-    db->txn_state = EF_TXN_STATE_NONE;
-    db->txn_active = 0;
-    db->txn_writer_pid = EF_TXN_WRITER_NONE;
+    ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_NONE);
+    ef_atomic_store_u8(&db->txn_active, 0U);
+    ef_atomic_store_u32(&db->txn_writer_pid, EF_TXN_WRITER_NONE);
     ef_undo_reset(db);
     ef_sb_txn_state_store(db->sb, EF_TXN_STATE_NONE);
     ef_sb_txn_lock_release(db->sb);
@@ -88,16 +88,16 @@ enum ef_err ef_txn_abort(struct ef_db *db)
     if (db == NULL) {
         return EF_ERR_NULL_ARG;
     }
-    if (!db->txn_active) {
+    if (ef_atomic_load_u8(&db->txn_active) == 0U) {
         ef_set_error(db, EF_OK);
         return EF_OK;
     }
-    db->txn_state = EF_TXN_STATE_ABORTING;
+    ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_ABORTING);
     ef_sb_txn_state_store(db->sb, EF_TXN_STATE_ABORTING);
     err = ef_undo_replay_reverse(db);
-    db->txn_state = EF_TXN_STATE_NONE;
-    db->txn_active = 0;
-    db->txn_writer_pid = EF_TXN_WRITER_NONE;
+    ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_NONE);
+    ef_atomic_store_u8(&db->txn_active, 0U);
+    ef_atomic_store_u32(&db->txn_writer_pid, EF_TXN_WRITER_NONE);
     ef_undo_reset(db);
     ef_sb_txn_state_store(db->sb, EF_TXN_STATE_NONE);
     ef_sb_txn_lock_release(db->sb);
@@ -118,14 +118,14 @@ enum ef_err ef_txn_recover_from_stale_lock(struct ef_db *db)
         return EF_OK;
     }
     /* Active transaction detected. Replay then clear. */
-    db->txn_state = EF_TXN_STATE_ABORTING;
+    ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_ABORTING);
     ef_set_error(db, EF_OK);
     {
         enum ef_err err = ef_undo_replay_reverse(db);
         ef_undo_reset(db);
         ef_sb_txn_state_store(db->sb, EF_TXN_STATE_NONE);
         ef_sb_txn_lock_release(db->sb);
-        db->txn_state = EF_TXN_STATE_NONE;
+        ef_atomic_store_u8(&db->txn_state, (uint8_t)EF_TXN_STATE_NONE);
         ef_db_mark_meta_dirty(db);
         return err;
     }

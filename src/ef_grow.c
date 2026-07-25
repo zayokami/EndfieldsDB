@@ -209,7 +209,7 @@ enum ef_err ef_grow(struct ef_db *db, uint64_t new_max_slots)
      * (e.g. via ef_alloc_ex outside a transaction) before opening a
      * transaction, so that slot relocation never overlaps with undo log
      * recording. */
-    if (db->txn_active) {
+    if (ef_txn_active(db)) {
         ef_set_error(db, EF_ERR_GROW);
         return EF_ERR_GROW;
     }

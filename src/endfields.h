@@ -152,10 +152,13 @@ struct ef_db {
     uint32_t index_seq;
     /* v5 transaction subsystem. The undo log lives in the file mmap at
      * undo_log_base (file-relative offset) and has undo_log_slots records. The
-     * transaction lock is shared with the superblock (reserved[24]). */
-    uint8_t txn_state;          /* EF_TXN_STATE_* */
-    uint8_t txn_active;         /* 1 between ef_txn_begin and ef_txn_commit/abort */
-    uint32_t txn_writer_pid;     /* process id of current writer (cross-process) */
+     * transaction lock is shared with the superblock (reserved[24]). These
+     * fields are volatile-qualified so that multi-threaded callers (e.g. the
+     * concurrent txn serialised test under TSAN) see synchronised updates via
+     * ef_atomic_load_u8 / ef_atomic_store_u8 (and _u32 for the pid field). */
+    volatile uint8_t txn_state;          /* EF_TXN_STATE_* */
+    volatile uint8_t txn_active;         /* 1 between ef_txn_begin and ef_txn_commit/abort */
+    volatile uint32_t txn_writer_pid;     /* process id of current writer (cross-process) */
     uint64_t undo_log_base;     /* file-relative offset to undo header */
     uint32_t undo_log_slots;    /* number of 32B records in the log */
     uint64_t undo_tail;         /* current write offset, in bytes from undo_log_base */
