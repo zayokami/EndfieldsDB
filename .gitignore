@@ -34,6 +34,9 @@ _gcc_test.c
 # IDE & editor
 .vs/
 .vscode/
+.claude/
+.agents/
+.cursor/
 .idea/
 *.swp
 *.swo
